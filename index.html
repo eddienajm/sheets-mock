@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheets Mock</title>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">
+<style>
+/* Layout: one glass whiteboard, the conductor's line under it, your controls under that.
+   Single deliberate light theme: it is a whiteboard in a lit room. */
+:root {
+  color-scheme: light;
+  --room: #d9dfe1;          /* wall behind the glass */
+  --glass: #f7f9f8;         /* the board */
+  --glass-edge: #c3cbce;
+  --ink: #1c2226;           /* black marker */
+  --blue: #2350b8;          /* conductor's marker */
+  --red: #b8322a;           /* errors, short */
+  --green: #2c7a4b;         /* good, long */
+  --amber: #a86a12;         /* warnings */
+  --muted: #5d686d;
+  --panel: #ffffff;
+  --num: "Roboto", "Helvetica Neue", Arial, sans-serif;  /* with tabular figures */
+  --ui: "Roboto", "Helvetica Neue", Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  background: var(--room); color: var(--ink);
+  font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1;
+  font: 15px/1.5 var(--ui);
+  padding-inline: 16px; padding-block: 16px 40px;
+}
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.wrap > * { min-width: 0; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 18px; }
+header h1 { font: 700 22px/1 var(--ui); margin: 0; letter-spacing: -.01em; }
+header .sub { color: var(--muted); }
+header .spacer { flex: 1; }
+header .meta { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+header .meta b { font-weight: 700; }
+header label { color: var(--muted); display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+
+button { font: inherit; cursor: pointer; border-radius: 6px; padding: 7px 14px; border: 1px solid var(--glass-edge); background: var(--panel); color: var(--ink); }
+button.primary { background: var(--ink); color: var(--glass); border-color: var(--ink); }
+button.ghost { background: transparent; }
+button:disabled { opacity: .45; cursor: default; }
+button:focus-visible, input:focus-visible { outline: 3px solid var(--blue); outline-offset: 2px; }
+
+/* ---------- the whiteboard ---------- */
+#board {
+  background: linear-gradient(170deg, #fbfcfc 0%, var(--glass) 55%, #eef2f1 100%);
+  border: 1px solid var(--glass-edge);
+  border-radius: 4px;
+  box-shadow: 0 1px 0 #fff inset, 0 10px 30px -18px rgba(20, 30, 35, .45);
+  padding: 30px 36px 34px;
+  font-family: var(--num);
+  font-size: 32px; line-height: 1.35;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 40px;
+  font-variant-numeric: tabular-nums;
+  overflow-x: auto;
+}
+#board .stock { grid-column: 1 / -1; text-align: center; font-size: 34px; font-weight: 500; }
+/* One grid for every row, so the strike column is the same width all the way down. */
+#board .grid { display: grid; grid-template-columns: minmax(max-content, 1fr) 4.2em minmax(max-content, 1fr) 2.8em; row-gap: 10px; align-items: center; justify-self: center; }
+#board .row, #board .heads { display: contents; }
+#board .d { font-size: 17px; color: var(--blue); text-align: right; }
+#board .v { font-size: 17px; color: var(--amber); text-align: right; }
+#board .grid.withv { grid-template-columns: minmax(max-content, 1fr) 4.2em minmax(max-content, 1fr) 2.8em 3.4em; }
+.trades thead { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.trades thead th, .trades thead td { background: var(--panel); }
+.trades tr.net td { font-weight: 700; border-bottom: 1px solid var(--glass-edge); padding-top: 5px; padding-bottom: 5px; }
+.trades tr.net td.num { color: var(--ink); }
+#board .heads > div { color: var(--muted); font: 700 15px/1 var(--ui); letter-spacing: .1em; text-transform: uppercase; padding-bottom: 2px; }
+#board .c { text-align: right; padding-right: .6em; }
+#board .p { text-align: left; padding-left: .6em; }
+#board .k { text-align: center; font-weight: 700; position: relative; }
+#board .side { display: grid; align-content: start; gap: 6px; padding-top: 44px; min-width: 9em; }
+#board .srow { display: flex; gap: 12px; align-items: baseline; }
+#board .slabel { font: 500 18px var(--ui); color: var(--muted); min-width: 6em; }
+
+.q { white-space: nowrap; display: inline-flex; align-items: baseline; }
+.q.blue { color: var(--blue); }
+.q.empty { color: var(--glass-edge); }
+.q.target { color: var(--red); font-weight: 700; }
+/* The asked-for market: empty slots typed straight onto the board. */
+form.q.target { margin: 0; align-items: center; color: var(--ink); }
+.slot { font: inherit; color: var(--ink); width: 2.6em; padding: 0 .1em; text-align: center; background: rgba(255, 255, 255, .7);
+  border: 2px dashed var(--red); border-radius: 6px; font-variant-numeric: tabular-nums; }
+.slot.qty { font: 500 15px var(--ui); width: 2.6em; padding: 1px 0; border-width: 1.5px; }
+.slot:focus { border-style: solid; outline: none; background: #fff; }
+.slash { padding: 0 .15em; color: var(--muted); }
+.px { font: inherit; color: inherit; background: none; border: 1px solid transparent; padding: 1px .25em; border-radius: 5px; min-width: 1.2em; }
+.px sub { font: 500 15px var(--ui); color: var(--muted); margin-left: 3px; vertical-align: -.35em; }
+.px.live { cursor: pointer; background: rgba(28, 34, 38, .05); }
+.px.live.bid:hover, .px.live.bid:focus-visible { background: rgba(184, 50, 42, .12); border-color: rgba(184, 50, 42, .45); }
+.px.live.ask:hover, .px.live.ask:focus-visible { background: rgba(44, 122, 75, .13); border-color: rgba(44, 122, 75, .45); }
+.px.order { color: var(--blue); font-weight: 700; }
+.px.picked { outline: 2px solid var(--ink); }
+
+/* ---------- conductor + controls ---------- */
+#say { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+#say .who { text-transform: uppercase; letter-spacing: .08em; font-size: 12px; color: var(--muted); }
+#say .line { font: 500 22px/1.4 var(--ui); color: var(--blue); min-width: 0; }
+
+#act:empty { display: none; }
+#act { background: var(--panel); border-radius: 6px; padding: 16px 18px; display: grid; gap: 12px; border: 1px solid var(--glass-edge); }
+#act p { margin: 0; }
+.mm label { display: block; font-weight: 700; margin-bottom: 8px; }
+.mmrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.mmrow input, .ticket input { font: 500 18px var(--num); width: 5.2em; padding: 4px 8px; border: 1px solid var(--glass-edge); border-radius: 6px; text-align: center; font-variant-numeric: tabular-nums; }
+.at { font-size: 16px; color: var(--muted); }
+.hint { color: var(--muted); }
+.err { color: var(--red); min-height: 1em; }
+.reply { font-weight: 700; }
+.ticket { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: var(--glass); border: 1px solid var(--glass-edge); border-radius: 6px; padding: 10px 12px; }
+.ticket input { width: 4.2em; }
+.tside { font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 13px; }
+.tside.buy { color: var(--green); } .tside.sell { color: var(--red); }
+.pos { display: grid; gap: 6px; }
+.pos .lbl { display: inline-block; min-width: 6.5em; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
+.num { font-variant-numeric: tabular-nums; font-weight: 700; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 13px; font-variant-numeric: tabular-nums; margin-right: 4px; border: 1px solid currentColor; }
+.chip.long { color: var(--green); } .chip.short { color: var(--red); } .chip.good { color: var(--green); }
+.muted { color: var(--muted); }
+.btns { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+
+.verdict { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.verdict li { padding: 6px 10px 6px 12px; border-left: 4px solid; border-radius: 2px; background: var(--glass); }
+.verdict .good { border-color: var(--green); } .verdict .warn { border-color: var(--amber); } .verdict .bad { border-color: var(--red); }
+.why { display: grid; gap: 6px; max-width: 68ch; }
+.why summary { cursor: pointer; color: var(--muted); font-size: 14px; text-transform: uppercase; letter-spacing: .08em; }
+.tl { max-height: 18em; overflow-y: auto; justify-self: start; }
+.trades tr.old td { color: var(--muted); font-weight: 400; }
+.trades tr.old td.long, .trades tr.old td.short { opacity: .6; }
+.trades caption { text-align: left; font: 700 13px var(--ui); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; padding-bottom: 6px; }
+.trades { border-collapse: collapse; font-size: 18px; justify-self: start; width: auto; }
+.trades td, .trades th { padding: 3px 18px 3px 0; }
+.trades th { font: 700 12px var(--ui); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; text-align: left; border-bottom: 1px solid var(--glass-edge); }
+.trades th.num { text-align: right; }
+.trades td.num { text-align: right; }
+.trades .long { color: var(--green); } .trades .short { color: var(--red); }
+.why h3 { margin: 4px 0 0; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.why b { font-weight: 700; }
+
+.summary { display: grid; gap: 10px; }
+.summary .big { font: 700 30px/1 var(--num); }
+.beats { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.beats li { display: grid; grid-template-columns: 2em minmax(0, 1fr); gap: 10px; padding: 5px 10px; border-left: 4px solid; background: var(--glass); }
+.beats li.good { border-color: var(--green); } .beats li.warn { border-color: var(--amber); } .beats li.bad { border-color: var(--red); }
+.beats .n { color: var(--muted); }
+
+@media (max-width: 640px) {
+  #board { grid-template-columns: minmax(0, 1fr); font-size: 20px; padding: 16px 12px; }
+  #board .side { padding-top: 6px; border-top: 1px dashed var(--glass-edge); }
+  #board .grid { grid-template-columns: minmax(max-content, 1fr) 3.2em minmax(max-content, 1fr) 2.2em; }
+  #board .grid.withv { grid-template-columns: minmax(max-content, 1fr) 3.2em minmax(max-content, 1fr) 2.2em 2.6em; }
+  #board .stock { font-size: 20px; }
+  #say .line { font-size: 17px; }
+}
+/* Your market on the board, and the conductor trading it. */
+.q.mine { align-items: center; }
+.px.mine { background: #fff; border: 1.5px solid var(--ink); }
+.px.mine.gone { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 2px; border-style: dashed; }
+.px.hit.anim { animation: hitflash 1.6s ease-out 1; }
+@keyframes hitflash {
+  0% { background: var(--amber); color: #fff; transform: scale(1.18); }
+  25% { transform: scale(1); }
+  100% { background: #fff; }
+}
+.hittag { font: 700 14px/1 var(--ui); color: #fff; background: var(--blue); border-radius: 999px; padding: 5px 10px; margin-left: .5em; white-space: nowrap; }
+.hittag.anim { animation: tagpop .5s cubic-bezier(.2, 1.5, .4, 1) 1; }
+@keyframes tagpop { from { transform: translateX(-8px) scale(.6); } to { transform: none; } }
+#say .lines { display: grid; gap: 2px; min-width: 0; }
+#say .asked { color: var(--muted); font-size: 15px; }
+#say .line b { color: var(--ink); }
+#say .line.anim { animation: sayin 1.2s ease-out 1; border-radius: 4px; }
+@keyframes sayin { from { background: rgba(35, 80, 184, .16); transform: translateY(4px); } to { background: transparent; transform: none; } }
+.prompt { color: var(--muted); }
+
+/* The explanation: cells it talks about light up, the rest dims. */
+.px, .q { position: relative; }
+#board .px, #board .q.mine { transition: opacity .3s; }
+#board.explaining .px { opacity: .25; }
+#board.explaining .mk, #board.explaining .mk .px { opacity: 1; }
+.mk-buy { background: rgba(44, 122, 75, .16) !important; box-shadow: 0 0 0 2px var(--green); }
+.mk-sell { background: rgba(184, 50, 42, .13) !important; box-shadow: 0 0 0 2px var(--red); }
+.mk-ref { box-shadow: 0 0 0 2px var(--blue); border-radius: 6px; }
+.mk-you { box-shadow: 0 0 0 2px var(--ink); border-radius: 6px; }
+.mk-bad { box-shadow: 0 0 0 2px var(--red); background: rgba(184, 50, 42, .1) !important; }
+.badge { position: absolute; left: 50%; bottom: 100%; transform: translate(-50%, -5px); z-index: 2; pointer-events: none;
+  font: 700 13px/1 var(--ui); white-space: nowrap; color: #fff; padding: 4px 8px; border-radius: 999px; background: var(--ink);
+  animation: badgein .35s cubic-bezier(.2, 1.5, .4, 1) both; }
+.mk-buy > .badge { background: var(--green); } .mk-sell > .badge, .mk-bad > .badge { background: var(--red); } .mk-ref > .badge { background: var(--blue); }
+@keyframes badgein { from { transform: translate(-50%, 4px) scale(.6); } to { transform: translate(-50%, -5px); } }
+.explain { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: center; background: var(--glass); border: 1px solid var(--glass-edge); border-radius: 6px; padding: 8px 10px; }
+.steptext { font-size: 17px; }
+.stepn { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; margin-right: 6px; }
+button.step { font-size: 22px; line-height: 1; padding: 4px 12px; }
+
+
+/* ---------- start screen ---------- */
+#setup { display: none; background: var(--panel); border: 1px solid var(--glass-edge); border-radius: 6px; padding: 22px 24px; max-width: 760px; }
+body.setup-mode #setup { display: grid; gap: 14px; }
+body.setup-mode #board, body.setup-mode #say, body.setup-mode #act, body.setup-mode .ingame { display: none; }
+#setup h2 { margin: 0; font: 700 22px/1.2 var(--ui); text-wrap: balance; }
+#setup p { margin: 0; max-width: 62ch; }
+#setup fieldset { border: 0; padding: 0; margin: 0 0 6px; display: grid; gap: 8px; }
+#setup legend { font: 700 12px var(--ui); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }
+.choice { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--glass-edge); border-radius: 6px; cursor: pointer; background: var(--glass); }
+.choice:has(input:checked) { border-color: var(--ink); background: #fff; }
+.choice input { margin-top: 4px; width: 18px; height: 18px; flex-shrink: 0; accent-color: var(--ink); }
+.choice > span { display: grid; gap: 2px; }
+.presets { display: flex; gap: 8px; flex-wrap: wrap; }
+.btns.start { justify-content: space-between; }
+
+/* ---------- ticket, your quotes, empty cells ---------- */
+.ticket #tk-px { width: 4.6em; }
+.tsides { display: inline-flex; border: 1px solid var(--glass-edge); border-radius: 6px; overflow: hidden; }
+.tside-btn { border: 0; border-radius: 0; padding: 6px 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; font-size: 13px; background: transparent; color: var(--muted); }
+.tside-btn.buy.on { background: var(--green); color: #fff; }
+.tside-btn.sell.on { background: var(--red); color: #fff; }
+button.px.mine.live { cursor: pointer; }
+button.px.mine.live:hover { box-shadow: 0 0 0 2px var(--blue); }
+button.px.add { color: var(--glass-edge); border: 1px dashed transparent; cursor: pointer; background: none; }
+button.px.add:hover, button.q.empty.quote:hover { color: var(--blue); border-color: var(--blue); }
+button.q.empty.quote { font: inherit; background: none; border: 1px dashed transparent; border-radius: 5px; padding: 0 .4em; cursor: pointer; color: var(--glass-edge); }
+.hint { font-size: 14px; }
+
+/* ---------- the explanation's "Why?" ---------- */
+.stepbody { display: grid; gap: 4px; min-width: 0; }
+details.why summary { cursor: pointer; color: var(--blue); font: 500 14px var(--ui); width: max-content; }
+details.why p { margin: 4px 0 2px; color: var(--ink); font-size: 15px; max-width: 72ch; line-height: 1.55; }
+#board.reviewing { outline: 3px dashed var(--glass-edge); outline-offset: -8px; }
+button.linkish { all: unset; cursor: pointer; display: contents; }
+.beats li:hover .t { text-decoration: underline; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Sheets Mock</h1>
+    <span class="sub" id="title-sub"></span>
+    <span class="spacer"></span>
+    <div class="meta">
+      <span class="ingame">Question <b id="progress"></b></span>
+      <button id="back" class="ghost ingame" title="Look back at the last question">&lsaquo; Back</button>
+      <button id="new" class="ghost ingame">New game</button>
+    </div>
+  </header>
+  <section id="setup" aria-label="choose what to practise"></section>
+  <section id="board" aria-label="whiteboard"></section>
+  <div id="say" aria-live="polite"></div>
+  <section id="act" aria-live="polite"></section>
+</div>
+
+<script src="js/engine.js"></script>
+<script src="js/scenario.js"></script>
+<script src="js/game.js"></script>
+<script src="js/ui.js"></script>
