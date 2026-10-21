@@ -18,19 +18,21 @@
 
   // ---------- start screen ----------
 
-  // Four levels, each adding to the one before.
+  // Five levels, each adding to the one before. The first two have a choice
+  // stock (no spread), so parity and the combos come without hedge costs.
   const COMBOS = { straddle: true, spreads: true, box: true, fly: true };
   const LEVELS = [
-    ['Just put-call parity', '', { pcp: true }],
-    ['Parity and combos', 'Adds straddles, spreads, boxes and flies.', { pcp: true, ...COMBOS }],
+    ['Just put-call parity, choice stock', 'The stock has no spread: buy or sell it at one price.', { pcp: true, choice: true }],
+    ['Parity and combos, choice stock', 'Adds straddles, spreads, boxes and flies.', { pcp: true, ...COMBOS, choice: true }],
+    ['Parity and combos, stock with a spread', 'Hedging now crosses the stock spread: |delta| × half the spread a lot.', { pcp: true, ...COMBOS }],
     ['Parity, combos and the stock moving', 'Adds the stock widening (width scales with delta) and the stock moving on a stale board (edge × size).', { pcp: true, ...COMBOS, width: true, move: true }],
     ['Vega and trade flow', 'All of the above, plus option-equivalent vega in the trade list and trade flow that moves fair value: every 50 vega it trades, 1 at the money.', { pcp: true, ...COMBOS, width: true, move: true, vega: true, flow: true }],
   ];
   function loadLevel() {
-    try { const n = +localStorage.getItem('sheetsmock.level'); if (n >= 0 && n < LEVELS.length) return n; } catch (e) {}
+    try { const n = +localStorage.getItem('sheetsmock.level5'); if (n >= 0 && n < LEVELS.length) return n; } catch (e) {}
     return 0;
   }
-  function saveLevel(n) { try { localStorage.setItem('sheetsmock.level', String(n)); } catch (e) {} }
+  function saveLevel(n) { try { localStorage.setItem('sheetsmock.level5', String(n)); } catch (e) {} }
 
   function showSetup() {
     game = null; review = null;
@@ -38,11 +40,12 @@
     const cur = loadLevel();
     $('#setup').innerHTML = `
       <h2>What do you want to be tested on?</h2>
-      <p class="muted">Five questions on one board, with whatever follow-ups your trades lead to.</p>
+      <p class="muted">The conductor builds the board one market at a time and trades your market when it has an arb. Prices tick in 0.5, 0.05 or 0.01, with sizes to match.</p>
       <form id="cfg">
         <fieldset>${LEVELS.map(([name, desc], i) => `<label class="choice"><input type="radio" name="level" value="${i}" ${i === cur ? 'checked' : ''}><span><b>${i + 1}. ${name}</b>${desc ? `<span class="muted">${desc}</span>` : ''}</span></label>`).join('')}</fieldset>
         <div class="btns start">
           <button type="button" id="replay-go" class="ghost">Replay 12 October (15 questions)</button>
+          <button type="button" id="replay20-go" class="ghost">Replay 20 October (11 questions)</button>
           <button type="submit" class="primary">Start: 5 questions</button>
         </div>
       </form>`;
@@ -55,13 +58,14 @@
     });
     // The night's questions are fixed; level 4 still adds the vega column.
     $('#replay-go').addEventListener('click', () => newGame('replay', null, { vega: !!LEVELS[level()][2].vega }));
+    $('#replay20-go').addEventListener('click', () => newGame('replay20', null, { vega: !!LEVELS[level()][2].vega }));
   }
 
 
   function newGame(kind, cfg, opts) {
     document.body.classList.remove('setup-mode');
     const seed = Math.floor(Math.random() * 9000) + 1000;
-    game = new Game(kind === 'replay' ? Sc.replay1012() : Sc.genSession(seed, cfg), opts);
+    game = new Game(kind === 'replay' ? Sc.replay1012() : kind === 'replay20' ? Sc.replay1020() : Sc.genSession(seed, cfg), opts);
     ticket = null; mmErr = ''; draft = blank(); stepIdx = 0; animKey = null; review = null;
     render();
     focusSlot();
@@ -158,13 +162,14 @@
     if (S.target && /^(V|CS|PS|BOX|FLY)/.test(S.target) && !sideIds.includes(S.target)) sideIds.push(S.target);
     const side = sideIds.map(id => `<div class="srow"><span class="slabel">${E.shortLabel(id)}</span>${cell(id)}</div>`).join('');
     $('#board').innerHTML = `
-      <div class="stock">S = ${cell('S', 'big')}</div>
+      <div class="stock">S = ${cell('S', 'big')}${b.choice ? '<span class="muted choice-tag">choice</span>' : ''}</div>
       <div class="grid ${V ? 'withv' : ''}">
         <div class="heads"><div class="c">C</div><div class="k"></div><div class="p">P</div><div class="d"></div>${V ? '<div class="v"></div>' : ''}</div>
         ${rows}
       </div>
       <div class="side">${side}</div>`;
     $('#board').classList.toggle('reviewing', review != null);
+    $('#board').classList.toggle('penny', (b.tick ?? 0.5) < 0.1);
   }
 
   // ---------- the question ----------

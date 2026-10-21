@@ -17,9 +17,10 @@ function play(g) {
     if (g.phase === 'ask') {
       const T = E.theo(g.model, b.target);
       const imp = E.implied(g.board, b.target);
-      let bid = E.floorT(Math.min(T - 1, imp.bid != null ? imp.bid - 0.5 : T - 1));
-      let ask = E.ceilT(Math.max(T + 1, imp.ask != null ? imp.ask + 0.5 : T + 1));
-      if (b.followUp) { if (b.followUp.exitSide === 'sell') ask = Math.max(ask, E.ceilT(b.followUp.be + 0.5)); else bid = Math.min(bid, E.floorT(b.followUp.be - 0.5)); }
+      const u = 2 * g.sc.U, t = E.TICK;
+      let bid = E.floorT(Math.min(T - u, imp.bid != null ? imp.bid - t : T - u));
+      let ask = E.ceilT(Math.max(T + u, imp.ask != null ? imp.ask + t : T + u));
+      if (b.followUp) { if (b.followUp.exitSide === 'sell') ask = Math.max(ask, E.ceilT(b.followUp.be + t)); else bid = Math.min(bid, E.floorT(b.followUp.be - t)); }
       const r = g.submitMarket(Math.max(0, bid), ask);
       if (r.error) throw new Error(`${r.error} ${b.target} T=${T} imp=${imp.bid}/${imp.ask} fu=${b.followUp && b.followUp.be}`);
       continue;
@@ -45,7 +46,7 @@ function play(g) {
       const f = g.fills[0];
       if (f && /^[CP]\d/.test(f.id) && g.R.chance(0.5)) {
         const lv = g.levels(f);
-        const px = lv.partnerSide === 'sell' ? E.ceilT(lv.be + 0.5) : E.floorT(lv.be - 0.5);
+        const px = lv.partnerSide === 'sell' ? E.ceilT(lv.be + E.TICK) : E.floorT(lv.be - E.TICK);
         if (px > 0) {
           const p = g.post(lv.partner, lv.partnerSide, px, f.qty);
           if (p.cross) g.trade(lv.partner, lv.partnerSide, Math.min(f.qty, topOf(g.board.quotes, {}, lv.partner)[lv.partnerSide === 'sell' ? 'bid' : 'ask'].size));
@@ -60,12 +61,19 @@ function play(g) {
       // fly is worth less than nothing (P7).
       const room = Sc.roomBoard({ ...g.board, quotes: q });
       const arb = E.bestArb(room).value;
-      if (arb > 1e-6) throw new Error(`room board has an arb of ${arb}`);
+      // The 20 October replay keeps the room's own mistakes (its board held a
+      // fly arb once the 95/90 put spread was 1.15 bid), so only generated
+      // sessions are held to this.
+      if (arb > 1e-6 && g.session.seed !== '20oct') throw new Error(`room board has an arb of ${arb}`);
       const ks = g.board.strikes;
       for (let x = 1; x < ks.length - 1; x++) {
         const f = E.theo(g.model, `FLY${ks[x - 1]}/${ks[x]}/${ks[x + 1]}`);
         if (f < -1e-6) throw new Error(`fly ${ks[x]} theo ${f} beat ${g.beat.type} calls ${ks.map(k => E.callTheo(g.model, k).toFixed(2)).join(' ')} S ${g.model.S} flowSteps ${g.flow && g.flow.steps}`);
       }
+      // E1/E2: short. An order question that then asks for your own market
+      // (O5) carries both stories; everything else stays within four steps.
+      const cap = g.beat.type === 'opp' && g.beat.asked ? 6 : 4;
+      if (j.steps.length > cap) throw new Error(`${j.steps.length} steps in a ${g.beat.type}: ${j.steps.map(x => x.text).join(' / ')}`);
       for (const s of j.steps) {
         if (!s.text || /NaN|undefined|null/.test(s.text + (s.why || ''))) throw new Error('bad text: ' + s.text + ' / ' + s.why);
         for (const m of s.marks) {
@@ -88,8 +96,12 @@ for (let i = 0; i < N; i++) {
   const CR = Sc.rng(seed * 7 + 1);
   for (const c of comps) cfg[c] = i % 7 === 0 ? c === 'pcp' : CR.chance(0.5);
   cfg.flow = CR.chance(0.4);
+  cfg.choice = CR.chance(0.4);
+  cfg.penny = CR.chance(0.4);
+  cfg.chain = CR.chance(0.8);
+  if (CR.chance(0.5)) delete cfg.penny;
   try {
-    const g = new Game(i % 10 === 9 ? Sc.replay1012() : Sc.genSession(seed, cfg), { seed });
+    const g = new Game(i % 10 === 9 ? (i % 20 === 19 ? Sc.replay1020() : Sc.replay1012()) : Sc.genSession(seed, cfg), { seed });
     const seq = [], next = g.next.bind(g);
     g.next = () => { seq.push(g.beat.type + (g.beat.followUp ? '+fu' : '')); return next(); };
     play(g);
@@ -103,7 +115,7 @@ for (let i = 0; i < N; i++) {
 }
 const gen = beats.filter((_, i) => i % 10 !== 9);
 console.log('sessions', N, 'errors', errors);
-console.log('steps per 5-question session: max', Math.max(...gen), 'mean', (gen.reduce((a, b) => a + b, 0) / gen.length).toFixed(1));
+console.log('steps per generated session: max', Math.max(...gen), 'mean', (gen.reduce((a, b) => a + b, 0) / gen.length).toFixed(1));
 console.log('judged beats by type', types);
 if (flows.length) console.log('flow sessions', flows.length, 're-marks per session', JSON.stringify(flows.reduce((h, x) => (h[x] = (h[x] || 0) + 1, h), {})));
 for (const l of long.sort((a, b) => b[0] - a[0]).slice(0, 3)) console.log('longest', l.join('  '));

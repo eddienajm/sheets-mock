@@ -133,15 +133,36 @@
     return { bid: Math.max(0, floorT(t - width / 2)), ask: ceilT(t + width / 2) };
   }
 
+  // A board's scale. tick: the smallest price step. U: the price unit widths
+  // and edges are set in (0.5 on a 0.5 tick; 0.05 in pennies, so a market is
+  // 10 to 20 cents wide, as on 20 October). L: sizes are multiplied by it
+  // (20 in pennies: standard size 500).
+  function scaleOf(board) {
+    return { tick: board.tick ?? 0.5, U: board.unit ?? 0.5, L: board.lotScale ?? 1 };
+  }
+  // The scales a session draws from: 12 October, one between, 20 October.
+  // lot is the standard size; lotScale multiplies the 25-lot sizes.
+  const SCALES = [
+    { tick: 0.5, unit: 0.5, lotScale: 1, lot: 25 },
+    { tick: 0.05, unit: 0.05, lotScale: 4, lot: 100 },
+    { tick: 0.01, unit: 0.05, lotScale: 20, lot: 500 },
+  ];
+  const PENNY = SCALES[2];
+
   // A fresh board: strike gap, stock width, sizes and which side of each
   // strike is quoted all vary, so the first question is not always the same.
-  function genBoard(R) {
+  // A choice stock has no spread (bid = offer), so hedging costs nothing and
+  // parity is the whole question.
+  function genBoard(R, opts = {}) {
+    const sc = opts.scale || (opts.penny ? PENNY : SCALES[0]);
+    E.setTick(sc.tick);
+    const U = sc.unit, L = sc.lotScale;
     for (let attempt = 0; attempt < 300; attempt++) {
       const spacing = R.pick([5, 10, 10]);
       const k0 = spacing * R.int(Math.ceil((spacing === 5 ? 40 : 80) / spacing), Math.floor((spacing === 5 ? 100 : 160) / spacing));
       const strikes = [-2, -1, 0, 1, 2].map(i => k0 + i * spacing);
-      const sw = R.pick([0.5, 1, 1, 1, 2]);
-      const sBid = k0 + R.int(-Math.floor(spacing / 4), Math.floor(spacing / 4)) - (sw === 2 ? 0.5 : 0);
+      const sw = opts.choice ? 0 : R.pick([1, 2, 2, 2, 4]) * U;
+      const sBid = k0 + R.int(-Math.floor(spacing / 4), Math.floor(spacing / 4)) - (sw === 4 * U ? sw / 4 : 0);
       const S = sBid + sw / 2;
       // One standard deviation of about two strike gaps, as on the night
       // (stock 100, strikes 10 apart, at-the-money extrinsic 8.5).
@@ -150,7 +171,7 @@
       let ok = true;
       for (const k of strikes) {
         const bs = E.bsCall(S, k, sdT, 1);
-        ext[k] = Math.max(0.5, round(bs.price - Math.max(S - k, 0)));
+        ext[k] = Math.max(U, round(bs.price - Math.max(S - k, 0)));
         cd[k] = Math.min(0.99, Math.max(0.01, round(bs.delta, 0.05)));
       }
       // Sanity: calls fall with strike, spreads inside the strike gap,
@@ -162,7 +183,8 @@
       }
       if (!ok) continue;
 
-      const sSize = R.pick([200, 500, 500, 1000]);
+      // A choice market is deep: hedges and arbs never run it dry.
+      const sSize = opts.choice ? 20000 : R.pick([200, 500, 500, 1000]) * L;
       const quotes = { S: { bid: sBid, ask: sBid + sw, bidSize: sSize, askSize: sSize } };
       for (const k of strikes) {
         // Mostly the out-of-the-money side, as on the night; sometimes the
@@ -171,14 +193,14 @@
         const atm = Math.abs(k - S) < spacing / 2;
         const kind = atm ? R.pick(['C', 'P']) : R.chance(0.25) ? (otm === 'C' ? 'P' : 'C') : otm;
         const t = kind === 'C' ? ct[strikes.indexOf(k)] : Math.max(k - S, 0) + ext[k];
-        const width = atm ? 2 : R.pick([1, 1, 2]);
+        const width = (atm ? 4 : R.pick([2, 2, 4])) * U;
         const q = quoteAround(t, width);
-        if (q.bid < 0.5) { ok = false; break; }
-        const size = R.pick([20, 50, 100, 100, 200]);
+        if (q.bid < U) { ok = false; break; }
+        const size = sc.lot * R.pick([1, 2, 2, 4]);
         quotes[kind + k] = { ...q, bidSize: size, askSize: size };
       }
       if (!ok) continue;
-      const board = { strikes, spacing, cd, ext0: ext, quotes, notes: [] };
+      const board = { strikes, spacing, cd, ext0: ext, quotes, notes: [], choice: !!opts.choice, tick: sc.tick, unit: U, lotScale: L, lot: sc.lot };
       if (E.bestArb(board).value > 1e-6) continue;
       return board;
     }
@@ -268,14 +290,20 @@
 
   function genSession(seed, cfg = { pcp: true }) {
     const R = rng(seed);
-    const board = genBoard(R);
+    // Every session draws its tick and size (C5) and runs the 20 October
+    // conductor (C1-C4), unless a test pins either.
+    const scale = typeof cfg.scale === 'number' ? SCALES[cfg.scale] : cfg.penny ? PENNY : R.pick(SCALES);
+    const chain = cfg.chain !== false;
+    const board = genBoard(R, { choice: !!cfg.choice, scale });
+    if (chain) board.thin = thinOut(R, board);
     const { strikes, spacing } = board;
+    const { U, L } = scaleOf(board);
     const sMid = mid(board.quotes.S);
     const atmK = strikes.reduce((a, k) => Math.abs(k - sMid) < Math.abs(a - sMid) ? k : a, strikes[0]);
-    const lot = () => R.pick([10, 20, 25, 25, 30, 50]);
+    const lot = () => R.pick([10, 20, 25, 25, 30, 50]) * L;
     // When the market posts liquidity, half the time it is priced right
     // (nothing in it) and half the time it gives something away.
-    const postEdge = () => (R.chance(0.5) ? 0 : R.pick([0.5, 1]));
+    const postEdge = () => (R.chance(0.5) ? 0 : (board.tick < U ? R.pick([1, 2, 5]) * board.tick : R.pick([1, 2]) * U));
     const used = new Set();
     const quoted = id => !!board.quotes[id];
     const partner = id => (id[0] === 'C' ? 'P' : 'C') + id.slice(1);
@@ -316,15 +344,15 @@
           const part = partner(deep);
           const side = deep[0] === 'P' ? 'ask' : 'bid';
           return { type: 'opp', lesson: 'walk',
-            pre: quoted(part) ? [{ op: 'thin', id: part, side: side === 'ask' ? 'bid' : 'ask', size: 50 }] : [],
-            walkGen: { id: deep, side, edges: [-1, -0.5, 0.5], size: 100, lastSize: 100 },
+            pre: quoted(part) ? [{ op: 'thin', id: part, side: side === 'ask' ? 'bid' : 'ask', size: 50 * L }] : [],
+            walkGen: { id: deep, side, edges: [-2 * U, -U, U], size: 100 * L, lastSize: 100 * L },
             say: side === 'ask' ? `I'm a seller of the ${E.label(deep)}.` : `I'm a buyer of the ${E.label(deep)}.` };
         },
       ],
       straddle: [
         // An order in the straddle, then your market in it (O5).
         () => {
-          const size = R.pick([20, 25, 40, 50]), side = pickSide('V' + atmK, ['bid', 'bid', 'ask']);
+          const size = R.pick([20, 25, 40, 50]) * L, side = pickSide('V' + atmK, ['bid', 'bid', 'ask']);
           const thinLeg = R.chance(0.5) ? [{ op: 'thin', id: (quoted('C' + atmK) ? 'C' : 'P') + atmK, side: side === 'bid' ? 'ask' : 'bid', size: size / 2 }] : [];
           return { type: 'opp', size, lesson: 'straddle', pre: thinLeg, askAfter: 'V' + atmK,
             gen: { id: 'V' + atmK, side, edge: postEdge() },
@@ -354,7 +382,7 @@
         () => {
           const [a, b] = adj(), cs = R.chance(0.5);
           const shown = `${cs ? 'CS' : 'PS'}${a}/${b}`, ask = `${cs ? 'PS' : 'CS'}${a}/${b}`;
-          return { type: 'make', target: take(ask), size: lot(), pre: [{ op: 'roomMarket', id: shown, width: R.pick([0.5, 1]) }] };
+          return { type: 'make', target: take(ask), size: lot(), pre: [{ op: 'roomMarket', id: shown, width: R.pick([1, 2]) * U }] };
         },
         // A wide call, a tight call spread and a tight put: the put order
         // is priced through the box.
@@ -362,9 +390,9 @@
           const [a, b] = adj();
           return { type: 'opp', size: lot(), lesson: 'box',
             pre: [
-              { op: 'widen', id: 'C' + b, by: 1.5 },
-              { op: 'roomMarket', id: `CS${a}/${b}`, width: 0.5 },
-              { op: 'roomMarket', id: 'P' + a, width: 0.5 },
+              { op: 'widen', id: 'C' + b, by: 3 * U },
+              { op: 'roomMarket', id: `CS${a}/${b}`, width: U },
+              { op: 'roomMarket', id: 'P' + a, width: U },
             ],
             gen: { id: 'P' + b, side: pickSide('P' + b), edge: postEdge() },
             say: `The ${b} calls are wide now. Here's an order in the ${b} put.` };
@@ -376,8 +404,8 @@
           const i = R.int(0, 2), id = `FLY${strikes[i]}/${strikes[i + 1]}/${strikes[i + 2]}`, side = pickSide(id);
           return { type: 'opp', size: lot(), lesson: 'fly', askAfter: id,
             pre: [
-              { op: 'roomMarket', id: `CS${strikes[i]}/${strikes[i + 1]}`, width: 0.5 },
-              { op: 'roomMarket', id: `CS${strikes[i + 1]}/${strikes[i + 2]}`, width: 0.5 },
+              { op: 'roomMarket', id: `CS${strikes[i]}/${strikes[i + 1]}`, width: U },
+              { op: 'roomMarket', id: `CS${strikes[i + 1]}/${strikes[i + 2]}`, width: U },
             ],
             gen: { id, side, edge: postEdge() },
             say: side === 'bid' ? `I'll bid for the ${E.label(id)}.` : `I'll offer the ${E.label(id)}.` };
@@ -388,7 +416,7 @@
         () => {
           const atmT = unquoted[strikes.indexOf(atmK)];
           const deep = unquoted[R.pick([0, 4])];
-          return { type: 'make', targets: [atmT, deep], size: lot(), noTrade: true, widen: 1, restoreStock: true };
+          return { type: 'make', targets: [atmT, deep], size: lot(), noTrade: true, widen: 2 * U, restoreStock: true };
         },
       ],
       // The stock moves and the resting book doesn't: one trade (S1).
@@ -396,6 +424,19 @@
         () => ({ type: 'pick', move: R.pick([-2, -1, 1, 2]) * (spacing >= 10 ? 1 : 0.5), restoreStock: false }),
       ],
     };
+
+    if (chain) {
+      const beats = chainBeats(R, board, cfg, { atmK, pickSide, postEdge });
+      // Then up to two of the older moves (O3 walked price, O4 pulled quote,
+      // an order in a single option, the box with a wide call).
+      const extra = [['pcp', B.pcp[2]], ['pcp', B.pcp[3]]];
+      if (cfg.straddle) extra.push(['straddle', B.straddle[1]]);
+      if (cfg.box) extra.push(['box', B.box[1]]);
+      for (const [c, f] of shuffle(R, extra).slice(0, 2)) beats.push({ ...f(), component: c });
+      // The later levels still add the stock widening and moving.
+      for (const c of ['width', 'move']) if (cfg[c]) beats.push({ ...B[c][0](), component: c });
+      return { seed, board, beats, title: 'Session ' + seed, cfg, flowDir, chain: true, noAggression: !cfg.flow };
+    }
 
     const on = COMPONENTS.filter(c => cfg[c]);
     if (!on.length) on.push('pcp');
@@ -418,6 +459,72 @@
       beats.push(beat);
     }
     return { seed, board, beats, title: 'Session ' + seed, cfg, flowDir };
+  }
+
+  // ---------- the 20 October conductor (C1-C4) ----------
+  //
+  // One strike shows only as a spread to its neighbour, as the 95 did through
+  // the 95/90 put spread. The conductor asks for markets in a chain, each one
+  // priced from what is already up (C1), trades a market that lays off at a
+  // profit (C2, beat.conductor = 'good'), and leans one way in a structure: an
+  // order at the board's level, then one through it (C3). A refresh follows a
+  // market that traded (C4, in Game.queueFollowUp).
+
+  function thinOut(R, board) {
+    const { strikes } = board, { U } = scaleOf(board);
+    const j = R.pick([1, 3]), n = j === 1 ? 0 : 4;
+    const kj = strikes[j], kn = strikes[n];
+    const m = deriveModel(board, null);
+    const id = j === 1 ? `PS${kn}/${kj}` : `CS${kj}/${kn}`;
+    const q = quoteAround(E.theo(m, id), 2 * U);
+    delete board.quotes['C' + kj]; delete board.quotes['P' + kj];
+    const size = board.quotes['C' + kn]?.bidSize ?? board.quotes['P' + kn]?.bidSize ?? 500;
+    board.quotes[id] = { ...q, bidSize: size, askSize: size };
+    board.ext0 = m.ext;
+    return { j, n, kj, kn, spread: id };
+  }
+
+  function chainBeats(R, board, cfg, { atmK, pickSide, postEdge }) {
+    const { strikes } = board, { tick, L } = scaleOf(board);
+    const th = board.thin;
+    const sMid = mid(board.quotes.S);
+    const lot = () => R.pick([500, 500, 1000]) * (L / 20 || 1);
+    const otm = k => (k < sMid ? 'P' : 'C') + k;
+    const partnerOfQuoted = k => (board.quotes['C' + k] ? 'P' : 'C') + k;
+    const make = (target, extra = {}) => ({ type: 'make', target, size: lot(), conductor: 'good', component: extra.component || 'pcp', ...extra });
+    // C3: the same order twice, first at the board's level (nothing in it),
+    // then through it.
+    const lean = (id, component) => {
+      const side = pickSide(id, ['bid', 'ask']), size = lot();
+      const through = R.pick([1, 2, 5, 9]) * tick;
+      const say = side === 'bid' ? `I'll bid for the ${E.label(id)}.` : `I'll offer the ${E.label(id)}.`;
+      return [
+        { type: 'opp', size, lesson: component, component, gen: { id, side, edge: 0 }, say },
+        { type: 'opp', size, lesson: component, component, gen: { id, side, edge: through }, say: side === 'bid' ? `I'll pay more for the ${E.label(id)}.` : `I'll sell the ${E.label(id)} lower.` },
+      ];
+    };
+    const beats = [];
+    // Parity first: the partner at the spread's neighbour, then the strike
+    // that only the spread prices.
+    beats.push(make(partnerOfQuoted(th.kn)));
+    beats.push(make(otm(th.kj)));
+    if (cfg.straddle) beats.push(make('V' + atmK, { component: 'straddle' }), ...lean('V' + atmK, 'straddle'));
+    const fi = th.j === 1 ? 0 : 2;
+    const fly = `FLY${strikes[fi]}/${strikes[fi + 1]}/${strikes[fi + 2]}`;
+    if (cfg.fly) beats.push(make(fly, { component: 'fly' }), ...lean(fly, 'fly'));
+    if (cfg.spreads) {
+      // The board's spread again, then the one next to it.
+      beats.push(make(th.spread, { component: 'spreads', pre: [{ op: 'pull', id: th.spread }] }));
+      const nx = th.j === 1 ? `PS${th.kj}/${strikes[2]}` : `CS${strikes[2]}/${th.kj}`;
+      beats.push(make(nx, { component: 'spreads' }));
+    }
+    // The other side of the box from the board's spread (P12).
+    if (cfg.box) beats.push(make(th.spread.startsWith('PS') ? 'C' + th.spread.slice(1) : 'P' + th.spread.slice(1), { component: 'box' }));
+    if (!cfg.straddle && !cfg.fly && !cfg.spreads && !cfg.box) {
+      // Parity only: the rest of the strikes.
+      for (const k of strikes) if (k !== th.kj && k !== th.kn && beats.length < QUESTIONS) beats.push(make(partnerOfQuoted(k)));
+    }
+    return beats;
   }
 
   function shuffle(R, arr) {
@@ -501,11 +608,77 @@
     return { seed: '12oct', board, beats, title: 'Replay: 12 October' };
   }
 
+  // ---------- the 20 October replay ----------
+  //
+  // The 20 October sheets mock: a choice stock, 0.01 increments, 500 lots.
+  // Numbers from the board photographs and the notes on them. Where the night's trade laid
+  // off at a profit the conductor is 'good' (C2); the 105/110 put spread is
+  // sold into a bid that didn't, as it was on the night.
+
+  function replay1020() {
+    const Q = (bid, ask, size = 500) => ({ bid, ask, bidSize: size, askSize: size });
+    const board = {
+      strikes: [90, 95, 100, 105, 110], spacing: 5,
+      cd: { 90: 0.85, 95: 0.7, 100: 0.5, 105: 0.3, 110: 0.2 },
+      choice: true, ...PENNY,
+      quotes: {
+        S: Q(100, 100, 20000),
+        C90: Q(10.6, 10.72), 'PS90/95': Q(1.1, 1.2), C100: Q(3.8, 3.98), P105: Q(6.9, 7.06), C110: Q(0.85, 0.93),
+      },
+      notes: [],
+    };
+    const beats = [
+      { type: 'make', target: 'V100', size: 500, conductor: 'buy',
+        say: 'Choice stock, prices in 0.01, standard size 500 lots. Can someone give me a price in the 100 straddle?' },
+      { type: 'opp', size: 1000, lesson: 'straddle',
+        pre: [{ op: 'set', id: 'C100', bid: 3.9 }, { op: 'set', id: 'V100', bid: 8.05, ask: null, conductor: true }],
+        say: "I'm 3.9 bid for the 100 calls. And I'll pay 8.05 for the 100 straddle, 1,000 times." },
+      { type: 'make', target: 'P95', size: 500, conductor: 'none', after: { bid: 1.69, ask: 1.93 },
+        pre: [{ op: 'erase', id: 'C100', side: 'ask' }, { op: 'set', id: 'V100', bid: 8.05, ask: null, bidSize: 1000 }],
+        say: "The 100 call offer's gone; the straddle stays 8.05 bid, 1,000. Can I have a price in the 95 put?" },
+      { type: 'make', target: 'P90', size: 500, conductor: 'good',
+        say: 'Can I also have a price in the 90 put?' },
+      { type: 'make', target: 'P95', size: 500, conductor: 'good', after: { bid: 1.7, ask: 1.91 },
+        pre: [{ op: 'erase', id: 'P95' }, { op: 'set', id: 'P90', bid: 0.7, ask: null, bidSize: 500 }],
+        say: "Someone's pulled the 1.69 bid in the 95 put. I'm 0.70 bid for the 90 put. Can I have a refresh in the 95 put?" },
+      { type: 'make', target: 'FLY90/95/100', size: 500, conductor: 'none',
+        pre: [
+          { op: 'erase', id: 'PS90/95', side: 'bid' },
+          { op: 'set', id: 'P90', bid: 0.7, ask: 0.75, bidSize: 500, askSize: 500 },
+          { op: 'set', id: 'V100', bid: 8.05, ask: 8.15, bidSize: 1000, askSize: 500 },
+        ],
+        say: "The 1.10 bid in the 95/90 put spread has been sold. The 90 put is 0.70 / 0.75, and I'm 8.05 / 8.15 in the straddle. Can I have a price in the 90/95/100 put fly?" },
+      { type: 'make', target: 'PS95/100', size: 500, conductor: 'none', after: { bid: 2.3, ask: 2.39 },
+        pre: [{ op: 'set', id: 'P95', ask: 1.85 }, { op: 'set', id: 'FLY90/95/100', bid: 1.2, ask: null, bidSize: 500 }],
+        say: "The 95 put offer is down to 1.85. I'm 1.2 bid for the fly. Market in the 100/95 put spread?" },
+      { type: 'make', target: 'PS90/95', size: 500, conductor: 'good',
+        say: 'Can I have a refresh in the 95/90 put spread?' },
+      // As on the night's board after the spread was bought back: the 90 put
+      // bid and the 95 put offer are gone, the room's spread is 1.15 / 1.20,
+      // and the conductor's 1.25 replaces her 1.2 fly bid.
+      { type: 'opp', size: 500, lesson: 'fly',
+        pre: [
+          { op: 'erase', id: 'FLY90/95/100' }, { op: 'erase', id: 'P90', side: 'bid' }, { op: 'erase', id: 'P95', side: 'ask' },
+          { op: 'set', id: 'PS90/95', bid: 1.15, ask: 1.2, bidSize: 500, askSize: 500 },
+          { op: 'set', id: 'FLY90/95/100', bid: 1.25, ask: null, conductor: true },
+        ],
+        say: "The 95/90 put spread is 1.15 / 1.20. I'm 1.25 bid for the fly." },
+      { type: 'make', target: 'CS95/100', size: 500, conductor: 'good',
+        say: 'Can I have a market in the 95/100 call spread?' },
+      { type: 'make', target: 'PS105/110', size: 500, conductor: 'sell',
+        pre: [{ op: 'set', id: 'V100', bid: 7.99, ask: 8.21 }, { op: 'set', id: 'C110', ask: 0.9 }],
+        say: "Straddle refresh: 7.99 / 8.21. I'm offered at 0.90 in the 110 calls. Can I have a market in the 105/110 put spread?" },
+    ];
+    // Only the conductor trades on the night: no market hitting your standing quotes between questions.
+    return { seed: '20oct', board, beats, title: 'Replay: 20 October', noAggression: true };
+  }
+
   // Resolve the generator-only ops ('gen', 'widen', 'roomMarket') against the
   // live board, just before a beat is shown, so prices follow whatever the
   // board looks like by then.
   function prepareBeat(board, beat, model) {
     const S0 = board.quotes.S;
+    const { tick, U } = scaleOf(board);
     if (beat.type === 'pick') {
       // The stock moves and the resting quotes stay where they were. Theo
       // moves by delta (P8); the room's quotes are stale until it re-marks.
@@ -523,7 +696,7 @@
         }
         return b;
       };
-      for (let i = 0; i < 6 && best(mv) < 0.5; i++) mv += Math.sign(mv) * (board.spacing >= 10 ? 1 : 0.5);
+      for (let i = 0; i < 6 && best(mv) < U; i++) mv += Math.sign(mv) * (board.spacing >= 10 ? 1 : 0.5);
       beat.move = mv;
       applyOps(board, [{ op: 'stock', bid: S0.bid + mv, ask: S0.ask + mv }]);
       for (const [id, q] of Object.entries(board.quotes)) if (id !== 'S') q.stale = true;
@@ -538,7 +711,7 @@
       beat.std = {};
       for (const t of beat.targets) {
         const imp = E.implied(roomBoard(board), t);
-        if (imp.bid != null && imp.ask != null) beat.std[t] = { bid: imp.bid - 0.5, ask: imp.ask + 0.5 };
+        if (imp.bid != null && imp.ask != null) beat.std[t] = { bid: imp.bid - tick, ask: imp.ask + tick };
       }
       applyOps(board, [{ op: 'stock', bid: S0.bid - beat.widen, ask: S0.ask + beat.widen }]);
       return deriveModel(board, model);
@@ -553,7 +726,7 @@
       if (o.op === 'widen') {
         const q = board.quotes[o.id];
         // Only the sides that are there: a pulled offer stays pulled.
-        if (q) applyOps(board, [{ op: 'set', id: o.id, bid: q.bid != null ? Math.max(0.5, floorT(q.bid - o.by)) : null, ask: q.ask != null ? ceilT(q.ask + o.by) : null }]);
+        if (q) applyOps(board, [{ op: 'set', id: o.id, bid: q.bid != null ? Math.max(U, floorT(q.bid - o.by)) : null, ask: q.ask != null ? ceilT(q.ask + o.by) : null }]);
       } else if (o.op === 'thin') {
         const q = board.quotes[o.id];
         if (q && q[o.side] != null) q[o.side + 'Size'] = o.size;
@@ -629,11 +802,11 @@
 
   function fmtP(x) {
     if (x == null) return '';
-    const r = Math.round(x * 100) / 100;
+    const r = Math.round(x * 1000) / 1000;
     return String(Object.is(r, -0) ? 0 : r);
   }
 
-  const api = { COMPONENTS, QUESTIONS, applyStep, roomBoard, clearConductor, rng, mid, deriveModel, genBoard, genSession, replay1012, prepareBeat, applyOps, quoteAround, fmtP };
+  const api = { PENNY, SCALES, scaleOf, COMPONENTS, QUESTIONS, applyStep, roomBoard, clearConductor, rng, mid, deriveModel, genBoard, genSession, replay1012, replay1020, prepareBeat, applyOps, quoteAround, fmtP };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Scenario = api;
 })(typeof window !== 'undefined' ? window : globalThis);

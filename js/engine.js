@@ -7,12 +7,17 @@
 // spread and a lower put, and it is what the linear program below exploits.
 
 (function (root) {
-  const TICK = 0.5;
+  // The tick is set per session (0.5 on 12 October, 0.01 on 20 October), so
+  // it lives on the board and the game sets it here when a session starts.
+  let TICK = 0.5;
+  const setTick = t => { TICK = t > 0 ? t : 0.5; };
   const EPS = 1e-9;
 
-  const round = (x, t = TICK) => Math.round(x / t + 1e-9) * t;
-  const floorT = (x, t = TICK) => Math.floor(x / t + 1e-9) * t;
-  const ceilT = (x, t = TICK) => Math.ceil(x / t - 1e-9) * t;
+  // Snap to the tick, cleaning up float noise (0.07 / 0.01 is 7.000000000000001).
+  const clean = x => Math.round(x * 1e9) / 1e9;
+  const round = (x, t = TICK) => clean(Math.round(x / t + 1e-9) * t);
+  const floorT = (x, t = TICK) => clean(Math.floor(x / t + 1e-9) * t);
+  const ceilT = (x, t = TICK) => clean(Math.ceil(x / t - 1e-9) * t);
 
   // ---------- instruments ----------
 
@@ -324,7 +329,15 @@
     if (r.status !== 'optimal') return null;
     const route = [];
     r.x.forEach((q, j) => { if (q > 1e-7) route.push({ id: legs[j].id, side: legs[j].side, qty: q, price: legs[j].price }); });
-    return { value: r.value, route };
+    // A choice market (bid = offer) lets the solver buy and sell the same
+    // thing for nothing. Net those out: same cash, a route you would trade.
+    for (const a of route) {
+      const b = route.find(x => x !== a && x.id === a.id && x.side !== a.side && Math.abs(x.price - a.price) < 1e-9 && x.qty > 0);
+      if (!b || !(a.qty > 0)) continue;
+      const m = Math.min(a.qty, b.qty);
+      a.qty -= m; b.qty -= m;
+    }
+    return { value: r.value, route: route.filter(x => x.qty > 1e-7) };
   }
 
   // Best price at which the board lets you buy (ask) or sell (bid) one unit
@@ -419,7 +432,7 @@
   }
 
   const api = {
-    TICK, round, floorT, ceilT, id, parse, label, shortLabel, vec,
+    get TICK() { return TICK; }, setTick, round, floorT, ceilT, id, parse, label, shortLabel, vec,
     callTheo, putTheo, shiftModel, theo, delta, strikeVega, vegaTable, vega, split, bsCall, simplex,
     legsOf, solve, implied, bestArb, bestLayoff,
     position, holdings, positionDelta, edge, isFlat, optionRisk,

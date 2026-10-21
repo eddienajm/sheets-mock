@@ -63,8 +63,12 @@ button:focus-visible, input:focus-visible { outline: 3px solid var(--blue); outl
   overflow-x: auto;
 }
 #board .stock { grid-column: 1 / -1; text-align: center; font-size: 34px; font-weight: 500; }
+#board .stock .choice-tag { font-size: 15px; margin-left: 10px; vertical-align: middle; }
 /* One grid for every row, so the strike column is the same width all the way down. */
-#board .grid { display: grid; grid-template-columns: minmax(max-content, 1fr) 4.2em minmax(max-content, 1fr) 2.8em; row-gap: 10px; align-items: center; justify-self: center; }
+#board .grid { display: grid; grid-template-columns: minmax(max-content, 1fr) 4.2em minmax(max-content, 1fr) 2.8em; row-gap: 10px; align-items: center; justify-self: safe center; }
+/* Penny prices (10.72 with a 500 under it) are wider: a smaller board fits. */
+#board.penny { font-size: 26px; gap: 8px 28px; }
+#board.penny .px sub { font-size: 13px; }
 #board .row, #board .heads { display: contents; }
 #board .d { font-size: 17px; color: var(--blue); text-align: right; }
 #board .v { font-size: 17px; color: var(--amber); text-align: right; }
@@ -158,6 +162,7 @@ form.q.target { margin: 0; align-items: center; color: var(--ink); }
   #board .grid { grid-template-columns: minmax(max-content, 1fr) 3.2em minmax(max-content, 1fr) 2.2em; }
   #board .grid.withv { grid-template-columns: minmax(max-content, 1fr) 3.2em minmax(max-content, 1fr) 2.2em 2.6em; }
   #board .stock { font-size: 20px; }
+  #board.penny { font-size: 18px; gap: 8px 16px; }
   #say .line { font-size: 17px; }
 }
 /* Your market on the board, and the conductor trading it. */

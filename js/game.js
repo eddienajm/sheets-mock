@@ -26,14 +26,54 @@
   const fmtP = Sc.fmtP;
 
   const clone = o => JSON.parse(JSON.stringify(o, (k, v) => (v instanceof Set ? undefined : v)));
+  // Three places: a penny board's straddle halves to 4.025.
   const n2 = x => {
-    const r = Math.round(x * 100) / 100;
+    const r = Math.round(x * 1000) / 1000;
     return (Object.is(r, -0) ? 0 : r).toString();
   };
   const signed = x => (x > 0 ? '+' : '') + n2(x);
   const isOption = id => /^[CP]\d/.test(id);
   const partnerOf = id => (id[0] === 'C' ? 'P' : 'C') + id.slice(1);
   const strikeOf = id => +id.slice(1);
+
+  // A bid at or below nothing is no bid at all.
+  const posBid = imp => (imp.bid != null && imp.bid <= 1e-9 ? { ...imp, bid: null, bidRoute: null } : imp);
+
+  // The pluses and minuses a structure puts on the strikes (P12).
+  function signsOf(id) {
+    const i = E.parse(id);
+    switch (i.kind) {
+      case 'V': return `+${i.k} call +${i.k} put`;
+      case 'CS': return `+${i.k1} call −${i.k2} call`;
+      case 'PS': return `+${i.k2} put −${i.k1} put`;
+      case 'BOX': return `+${i.k1} call −${i.k2} call +${i.k2} put −${i.k1} put`;
+      case 'FLY': return `+${i.k1} −2 × ${i.k2} +${i.k3}`;
+      default: return '';
+    }
+  }
+
+  // What a set of option trades adds up to, if it is one structure: its id,
+  // how many, and the price paid (A7).
+  function structureOf(trades, strikes) {
+    const opt = trades.filter(t => t.id !== 'S');
+    if (new Set(opt.map(t => t.id)).size < 2) return null;
+    const pos = E.position(opt);
+    const ids = [];
+    for (let a = 0; a < strikes.length; a++) {
+      ids.push('V' + strikes[a]);
+      for (let b = a + 1; b < strikes.length; b++) ids.push(`CS${strikes[a]}/${strikes[b]}`, `PS${strikes[a]}/${strikes[b]}`, `BOX${strikes[a]}/${strikes[b]}`);
+      if (a + 2 < strikes.length) ids.push(`FLY${strikes[a]}/${strikes[a + 1]}/${strikes[a + 2]}`);
+    }
+    for (const id of ids) {
+      const v = E.vec(id), keys = new Set([...Object.keys(v.w), ...Object.keys(pos.w)]);
+      const k0 = Object.keys(v.w)[0], q = (pos.w[k0] || 0) / v.w[k0];
+      if (Math.abs(q) < 1e-9) continue;
+      if ([...keys].every(k => Math.abs((pos.w[k] || 0) - q * (v.w[k] || 0)) < 1e-7)) {
+        return { id, qty: q, price: v.c - (pos.cash + pos.c) / q };
+      }
+    }
+    return null;
+  }
   const sz = (q, s) => (q && q[s] != null ? q[s + 'Size'] ?? 100 : 0);
 
   // Best bid and offer for an instrument across the room and your quotes.
@@ -56,6 +96,8 @@
     // opts.seed makes the market's coin flips repeatable (tests).
     constructor(session, opts = {}) {
       this.session = session;
+      E.setTick(session.board.tick);
+      this.sc = Sc.scaleOf(session.board);
       this.R = Sc.rng(opts.seed ?? (Date.now() & 0x7fffffff));
       this.board = clone(session.board);
       this.board.mine = {};
@@ -77,7 +119,7 @@
       // the room re-marks the board by `shift` at the money (F1).
       const cfg = session.cfg || {};
       this.showVega = !!(opts.vega || cfg.vega || cfg.flow);
-      this.flow = cfg.flow && session.flowDir ? { dir: session.flowDir, vega: 0, steps: 0, per: 50, shift: 1 } : null;
+      this.flow = cfg.flow && session.flowDir ? { dir: session.flowDir, vega: 0, steps: 0, per: 50 * this.sc.L, shift: 2 * this.sc.U } : null;
       this.next();
     }
 
@@ -169,8 +211,8 @@
       // replaces yours there.
       if (b.type === 'make' && b.after) {
         let q = b.after;
-        if (q === 'room') q = Sc.quoteAround(E.theo(this.model, b.target), 1);
-        Sc.applyOps(this.board, [{ op: 'set', id: b.target, bid: q.bid, ask: q.ask, bidSize: 100, askSize: 100 }]);
+        if (q === 'room') q = Sc.quoteAround(E.theo(this.model, b.target), 2 * this.sc.U);
+        Sc.applyOps(this.board, [{ op: 'set', id: b.target, bid: q.bid, ask: q.ask, bidSize: b.size ?? 100 * this.sc.L, askSize: b.size ?? 100 * this.sc.L }]);
         delete this.board.mine[b.target];
       }
       if (b.restoreStock && b.stockBefore) {
@@ -180,9 +222,9 @@
         // The room re-marks its stale quotes by delta.
         for (const [id, q] of Object.entries(this.board.quotes)) {
           if (!q.stale) continue;
-          const sh = E.round(E.delta(this.model, id) * b.move);
-          if (q.bid != null) q.bid = q.bid + sh >= 0.5 ? q.bid + sh : null;
-          if (q.ask != null) q.ask = Math.max(q.ask + sh, 0.5);
+          const sh = E.round(E.delta(this.model, id) * b.move), t = E.TICK;
+          if (q.bid != null) q.bid = q.bid + sh >= t ? E.round(q.bid + sh) : null;
+          if (q.ask != null) q.ask = E.round(Math.max(q.ask + sh, t));
           delete q.stale;
           if (q.bid == null && q.ask == null) delete this.board.quotes[id];
         }
@@ -247,8 +289,9 @@
         if (id === 'S' || q.conductor) continue;
         const sh = shiftOf(id);
         if (!sh) continue;
-        if (q.bid != null) q.bid = q.bid + sh >= 0.5 ? q.bid + sh : null;
-        if (q.ask != null) q.ask = Math.max(q.ask + sh, q.bid != null ? q.bid + 0.5 : 0.5);
+        const t = E.TICK;
+        if (q.bid != null) q.bid = q.bid + sh >= t ? E.round(q.bid + sh) : null;
+        if (q.ask != null) q.ask = E.round(Math.max(q.ask + sh, q.bid != null ? q.bid + t : t));
         if (q.bid == null && q.ask == null) delete b.quotes[id];
         this.flowIds.add(id);
         b.changed.add(id);
@@ -260,8 +303,9 @@
         for (const r of arb.route) {
           const q = b.quotes[r.id];
           if (!q || r.id === 'S') continue;
-          if (r.side === 'buy' && q.ask != null) q.ask += 0.5;
-          if (r.side === 'sell' && q.bid != null) q.bid = q.bid - 0.5 >= 0.5 ? q.bid - 0.5 : null;
+          const t = E.TICK;
+          if (r.side === 'buy' && q.ask != null) q.ask = E.round(q.ask + t);
+          if (r.side === 'sell' && q.bid != null) q.bid = q.bid - t >= t ? E.round(q.bid - t) : null;
         }
       }
       for (const k of b.strikes) this.model.ext[k] = Math.max(0, this.model.ext[k] + sk[k]);
@@ -278,6 +322,7 @@
     // side furthest through theo, if any. Clueless: any side, favouring what
     // you just posted. At most once between agenda questions.
     marketAggression() {
+      if (this.session.noAggression) return false;
       if (this.aggr.gap >= (this.flow ? 2 : 1) || this.aggr.total >= (this.flow ? 8 : 4)) return false;
       let sides = [];
       for (const [id, q] of Object.entries(this.board.mine)) {
@@ -301,7 +346,7 @@
         pick = this.R.pick(fresh.length ? fresh : sides);
       }
       if (!pick) return false;
-      const qty = Math.min(pick.size, this.R.pick(this.flow ? [25, 50, 50] : [10, 20, 25, 25, 50]));
+      const qty = Math.min(pick.size, this.R.pick(this.flow ? [25, 50, 50] : [10, 20, 25, 25, 50]) * this.sc.L);
       this.aggr.gap++; this.aggr.total++;
       const tr = this.hitMine(pick.id, pick.side, qty);
       this.startBeat({ type: 'react', target: pick.id, hit: this.hit, hitTrade: tr });
@@ -354,8 +399,15 @@
       // most of the time.
       let side = null;
       const offBid = bid - T, offAsk = T - ask;
+      // How much each side of your market lays off for on the board (M1).
+      const layBid = imp.bid != null ? imp.bid - bid : -Infinity, layAsk = imp.ask != null ? ask - imp.ask : -Infinity;
       if (ev.arbBid || ev.arbAsk) side = ev.arbBid ? 'bid' : 'ask';
-      else if (b.noTrade) side = null;
+      else if (b.noTrade || b.conductor === 'none') side = null;
+      // The conductor of a scripted night trades the side it traded then.
+      else if (b.conductor === 'buy' || b.conductor === 'sell') side = b.conductor === 'buy' ? 'ask' : 'bid';
+      // C2: trade a good market, the side that lays off at a profit, and
+      // see whether the arb gets done. A market with nothing in it is left.
+      else if (b.conductor === 'good') side = Math.max(layBid, layAsk) > 1e-9 ? (layAsk >= layBid ? 'ask' : 'bid') : null;
       else if (this.R.chance(0.5)) side = offBid > 1e-9 || offAsk > 1e-9 ? (offBid >= offAsk ? 'bid' : 'ask') : null;
       else if (this.R.chance(0.75)) {
         const v = E.vega(this.model, t);
@@ -497,6 +549,11 @@
     // Skipped if you are flat, or already quoting the partner yourself.
     queueFollowUp() {
       const b = this.beat, h = this.hit;
+      // C4: once a market the conductor traded is laid off, ask for it again.
+      if (this.session.chain && b.type === 'make' && !b.followUp && !b.refresh && h && h.id === b.target && this.status().flat) {
+        this.queue.push({ type: 'make', target: b.target, size: b.size, conductor: 'good', refresh: true, pre: [{ op: 'pull', id: b.target }] });
+        return;
+      }
       if (!h || !isOption(h.id) || b.followUp || b.type === 'pick') return;
       if (this.status().flat) return;
       const fill = this.fills[0];
@@ -617,87 +674,180 @@
     // "K + C − P" written out with the numbers.
     futText(K, c, p) { return `${K} + ${fmtP(c)} − ${fmtP(p)} = ${fmtP(K + c - p)}`; }
 
-    // ---------- the frameworks behind each step ----------
+    // ---------- explanations (E1-E5 in PRINCIPLES.md) ----------
+    //
+    // Short and specific: one line that prices the instrument from the
+    // board, then the trade that happened and what it lets you do. A "why"
+    // is a sentence or two about this case.
 
     whySynth(K) {
-      return `A call and a put on the same strike make a future. Long the call and short the put pays S − ${K} at expiry, whatever happens: a future bought at ${K} + C − P. Long the put and short the call is that future sold. So add up K + C − P and compare it with the stock: sell the future above the stock offer, or buy it below the stock bid, and you are flat with the difference.`;
-    }
-    whyPartner(fill, lv) {
-      const K = lv.K, p = fill.price, s = lv.s;
-      const v = fill.side === 'buy' ? 'buying' : 'selling';
-      return fill.id[0] === 'P'
-        ? `Another way to see it, P = C − S + K: ${v} the ${K} put at ${fmtP(p)} with the stock at ${fmtP(s)} is ${v} the ${K} call at ${fmtP(p)} + ${fmtP(s)} − ${K} = ${fmtP(p + s - K)}.`
-        : `Another way to see it, C = P + S − K: ${v} the ${K} call at ${fmtP(p)} with the stock at ${fmtP(s)} is ${v} the ${K} put at ${fmtP(p)} − ${fmtP(s)} + ${K} = ${fmtP(p - s + K)}.`;
+      return `A call bought and a put sold at ${K} is a future bought at ${K} + C − P; the reverse is one sold. Compare it with the stock.`;
     }
     whyHedge(fill) {
-      const d = E.delta(this.model, fill.id), sg = fill.side === 'buy' ? 1 : -1;
-      const S = this.start.board.quotes.S, half = (S.ask - S.bid) / 2;
-      const sh = sg * fill.qty * d;
-      return `Delta is how many shares one option moves like. ${n2(fill.qty)} ${E.label(fill.id)} at ${signed(d)} is ${signed(Math.round(sh * 10) / 10)} shares, so ${sh > 0 ? 'sell' : 'buy'} ${Math.round(Math.abs(sh))} stock to be delta flat. Crossing the stock costs |delta| × half its spread a lot: ${n2(Math.abs(d))} × ${n2(half)} = ${n2(Math.abs(d) * half)}. Deep in-the-money options are nearly a full share, so they need more edge than out-of-the-money ones. On a round trip through parity the first leg carries most of the hedge, and the partner only the rest.`;
+      const d = E.delta(this.model, fill.id), S = this.start.board.quotes.S, half = (S.ask - S.bid) / 2;
+      const sh = (fill.side === 'buy' ? 1 : -1) * fill.qty * d;
+      return `${n2(fill.qty)} × ${signed(d)} delta is ${signed(Math.round(sh))} shares.${half > 0 ? ` Crossing the stock costs ${n2(Math.abs(d))} × ${n2(half)} = ${n2(Math.abs(d) * half)} a lot.` : ''}`;
     }
     whyLean(fill, lv) {
-      const long = fill.side === 'buy';
-      return `You're ${long ? 'long' : 'short'} the ${E.label(fill.id)}: you want ${long ? 'buyers' : 'sellers'} now, not more ${long ? 'sellers' : 'buyers'}, so move both sides ${long ? 'down' : 'up'}. The ${E.label(lv.partner)} breaks even at ${fmtP(lv.be)}, the price where ${lv.K} + C − P equals the stock you hedge with (${fmtP(lv.s)}). Any ${lv.partnerSide === 'sell' ? 'offer above' : 'bid below'} it arbs you to flat when it trades. Resting a price inside the board can earn more than crossing it.`;
+      return `Break-even is the ${E.label(lv.partner)} price where ${lv.K} + C − P equals the stock you hedged with (${fmtP(lv.s)}). Any ${lv.partnerSide === 'sell' ? 'offer above' : 'bid below'} it arbs you to flat if it trades.`;
     }
     whyTheo(id) {
-      const m = this.model, inst = E.parse(id), T = E.theo(m, id);
-      const S = m.S;
+      const inst = E.parse(id);
+      const w = {
+        C: 'A call and a put on one strike carry the same extrinsic value: P = C − S + K.',
+        P: 'A call and a put on one strike carry the same extrinsic value: P = C − S + K.',
+        V: inst.kind === 'V' ? `Call plus put: ${n2(E.callTheo(this.model, inst.k))} + ${n2(E.putTheo(this.model, inst.k))} = ${n2(E.theo(this.model, id))}.${Math.abs(this.model.S - inst.k) < 1e-9 ? ' At the money they are the same, so it is twice either.' : ''}` : '',
+        CS: `${signsOf(id)}: buying a call spread buys the lower strike and sells the upper. It is worth between 0 and the gap.`,
+        PS: `${signsOf(id)}: buying a put spread buys the upper strike and sells the lower, the opposite diagonal from a call spread. With the call spread it makes a box worth the gap.`,
+        BOX: 'Call spread plus put spread on the same strikes pays the gap, whatever happens.',
+        FLY: `${signsOf(id)}: the lower spread less the upper. A put fly and a call fly are the same.`,
+      }[inst.kind] || '';
+      return w + this.flowWhy();
+    }
+    whyRoute(id, route) {
+      const ids = (route || []).map(r => r.id);
+      if (isOption(id) && ids.includes(partnerOf(id))) return this.whySynth(E.parse(id).k);
+      if (/^V/.test(id) && ids.includes('S')) return 'A put is a call less a share plus K, so two calls and a share sold make the straddle.';
+      if (ids.some(x => /^(CS|PS|BOX)/.test(x)) && /^(CS|PS)/.test(id)) return 'Call spread + put spread is a box worth the gap, so a sold call spread is arbed by selling the put spread too.';
+      return this.whyTheo(id);
+    }
+
+    // "100 call 3.8 / 3.98", "90 put 0.7 bid".
+    quoteText(quotes, id) {
+      const q = quotes[id];
+      if (!q) return '';
+      if (q.bid != null && q.ask != null) return `${E.label(id)} ${fmtP(q.bid)} / ${fmtP(q.ask)}`;
+      return q.bid != null ? `${E.label(id)} ${fmtP(q.bid)} bid` : `${E.label(id)} offered ${fmtP(q.ask)}`;
+    }
+
+    // The relationship that prices `id` off the legs the board used.
+    ruleFor(id, used) {
+      const inst = E.parse(id), has = re => used.some(x => re.test(x));
       if (inst.kind === 'C' || inst.kind === 'P') {
-        const other = partnerOf(id), oq = this.start.board.quotes[other];
-        const sp = E.split(m, inst);
-        let src = '';
-        if (oq && oq.bid != null && oq.ask != null && !oq.conductor && !oq.stale) {
-          src = `The ${E.label(other)} is ${fmtP(oq.bid)} / ${fmtP(oq.ask)}, mid ${n2((oq.bid + oq.ask) / 2)}, with stock mid ${n2(S)}. `;
-        }
-        const pc = inst.kind === 'P' ? `P = C − S + K = ${n2(E.callTheo(m, inst.k))} − ${n2(S)} + ${inst.k}` : `C = P + S − K = ${n2(E.putTheo(m, inst.k))} + ${n2(S)} − ${inst.k}`;
-        return `${src}Theo comes from the board, through parity: ${pc} = ${n2(T)}. That is ${sp.intrinsic ? `${n2(sp.intrinsic)} intrinsic and ` : ''}${n2(sp.extrinsic)} extrinsic; the call and put on a strike share the same extrinsic.${this.flowWhy()}`;
+        if (used.includes(partnerOf(id))) return `Same extrinsic as the ${E.label(partnerOf(id))}`;
+        const sp = used.filter(x => /^(CS|PS|V|FLY)/.test(x));
+        return sp.length ? `Through the ${sp.map(x => E.label(x)).join(' and ')}` : 'From the board';
       }
       if (inst.kind === 'V') {
-        const c = E.callTheo(m, inst.k), p = E.putTheo(m, inst.k);
-        return `A straddle is a call plus a put: ${n2(c)} + ${n2(p)} = ${n2(T)}. Since P = C − S + K it is also two calls, less a share, plus K: 2 × ${n2(c)} − ${n2(S)} + ${inst.k} = ${n2(T)}. That is why buying two calls and selling stock is the same trade as buying the straddle.`;
+        const atm = Math.abs(this.model.S - inst.k) < 1e-9;
+        if (atm && used.includes('C' + inst.k) && !used.includes('P' + inst.k)) return 'At the money, twice the call';
+        if (atm && used.includes('P' + inst.k) && !used.includes('C' + inst.k)) return 'At the money, twice the put';
+        return 'Call plus put';
       }
-      if (inst.kind === 'CS') return `A call spread is the lower call less the upper: ${n2(E.callTheo(m, inst.k1))} − ${n2(E.callTheo(m, inst.k2))} = ${n2(T)}. It is worth between 0 and the strike gap, ${inst.k2 - inst.k1}.`;
-      if (inst.kind === 'PS') return `A put spread is the upper put less the lower: ${n2(E.putTheo(m, inst.k2))} − ${n2(E.putTheo(m, inst.k1))} = ${n2(T)}. With the call spread it makes a box worth the strike gap, so it is also ${inst.k2 - inst.k1} less the call spread.`;
-      if (inst.kind === 'BOX') return `A box is a call spread plus a put spread and pays the strike gap, ${inst.k2 - inst.k1}, whatever happens.`;
-      if (inst.kind === 'FLY') return `A fly is the lower call spread less the upper one: ${n2(E.callTheo(m, inst.k1))} − 2 × ${n2(E.callTheo(m, inst.k2))} + ${n2(E.callTheo(m, inst.k3))} = ${n2(T)}. It can never be worth less than 0 or more than the wing, ${inst.k2 - inst.k1}; the call fly and the put fly are the same thing.`;
-      return `Theo ${n2(T)}.`;
-    }
-    // Which framework a board route uses.
-    whyRoute(id, route) {
-      const inst = E.parse(id);
-      const ids = (route || []).map(r => r.id);
-      if (isOption(id) && ids.includes(partnerOf(id))) return this.whySynth(inst.k);
-      if (inst.kind === 'V' || inst.kind === 'FLY') return this.whyTheo(id);
-      if (ids.some(x => /^(CS|PS|BOX)/.test(x)) || inst.kind === 'PS' || inst.kind === 'CS') return 'Call spread + put spread on the same strikes is a box, worth the strike gap. So a put spread is the gap less the call spread, a put is a put spread plus the lower put, and so on: every leg can be rebuilt from the others.';
-      return this.whySynth(inst.k ?? '');
+      if (inst.kind === 'CS') return has(/^(PS|BOX)/) ? `Box: ${inst.k2 - inst.k1} less the put spread` : 'Lower call less upper call';
+      if (inst.kind === 'PS') return has(/^(CS|BOX)/) ? `Box: ${inst.k2 - inst.k1} less the call spread` : 'Upper put less lower put';
+      if (inst.kind === 'FLY') return signsOf(id);
+      if (inst.kind === 'BOX') return 'Call spread plus put spread';
+      return 'From the board';
     }
 
-    theoStep(t) {
-      const T = E.theo(this.model, t);
-      return { text: `Theo ${n2(T)}.`, why: this.whyTheo(t), marks: [{ id: t, side: null, act: 'you', note: `theo ${n2(T)}` }] };
+    // E1: one line pricing `id` from the board as the question started.
+    priceStep(id) {
+      const room = Sc.roomBoard(this.start.board), T = E.theo(this.model, id);
+      const imp = posBid(E.implied(room, id));
+      const mark = { id, side: null, act: 'you', note: `theo ${n2(T)}` };
+      const routes = [...(imp.bidRoute || []), ...(imp.askRoute || [])];
+      const used = [...new Set(routes.map(r => r.id))].filter(x => x !== id);
+      const S = room.quotes.S, choice = S && S.bid === S.ask;
+      const ks = new Set(this.legsOf(id).map(x => x.slice(1)));
+      // A straddle at a strike the structure needs stands in for that leg:
+      // "100 put 4.025 / 4.075 from the straddle".
+      const legs = [];
+      let viaV = false;
+      for (const x of used.filter(x => x !== 'S').sort((p, q) => (parseFloat(p.replace(/^\D+/, '')) - parseFloat(q.replace(/^\D+/, ''))))) {
+        const k = x.slice(1);
+        const leg = /^[CPV]\d/.test(x) && !isOption(id) && !/^V/.test(id) && ks.has(k) ? this.legsOf(id).find(l => l.slice(1) === k) : null;
+        if (leg && leg !== x) {
+          if (legs.some(t => t.startsWith(E.label(leg) + ' '))) continue;
+          const li = posBid(E.implied(room, leg));
+          const m = li.bid != null && li.ask != null ? `${fmtP(li.bid)} / ${fmtP(li.ask)}` : li.bid != null ? `${fmtP(li.bid)} bid` : li.ask != null ? `offered ${fmtP(li.ask)}` : null;
+          if (m) { legs.push(`${E.label(leg)} ${m} from the ${/^V/.test(x) ? 'straddle' : x[0] === 'C' ? 'call' : 'put'}`); viaV = true; continue; }
+        }
+        const t = this.quoteText(room.quotes, x);
+        if (t) legs.push(t);
+      }
+      // The stock matters to parity; on a choice stock behind a straddle it is just the conversion.
+      if (used.includes('S') && S && !(choice && viaV && !isOption(id))) legs.push(`stock ${choice ? fmtP(S.bid) : `${fmtP(S.bid)} / ${fmtP(S.ask)}`}`);
+      const mkt = imp.bid != null && imp.ask != null ? `${fmtP(imp.bid)} / ${fmtP(imp.ask)}` : imp.bid != null ? `${fmtP(imp.bid)} bid` : imp.ask != null ? `offered ${fmtP(imp.ask)}` : null;
+      if (!mkt) return { text: `Nothing on the board prices it: theo ${n2(T)}.`, why: this.whyTheo(id), marks: [mark] };
+      const rule = this.ruleFor(id, used);
+      return { text: `${rule}: ${legs.join(', ')} → ${E.label(id)} ${mkt}, theo ${n2(T)}.`,
+        why: /^Through/.test(rule) ? `A spread plus its other leg rebuilds the option: the ${E.label(id)} is the ${used.filter(x => /^(PS|CS)/.test(x)).map(x => E.label(x)).join(' and ')} plus the leg next to it.` : this.whyTheo(id),
+        marks: [mark, ...used.filter(x => x !== 'S').map(x => ({ id: x, side: null, act: 'ref', note: '' }))] };
+    }
+    theoStep(t) { return this.priceStep(t); }
+
+    // The options a structure is made of, in the kind it is quoted in.
+    legsOf(id) {
+      const i = E.parse(id);
+      switch (i.kind) {
+        case 'CS': return ['C' + i.k1, 'C' + i.k2];
+        case 'PS': return ['P' + i.k2, 'P' + i.k1];
+        case 'FLY': { const t = this.start.board.quotes['P' + i.k1] || this.start.board.quotes['P' + i.k3] ? 'P' : 'C'; return [t + i.k1, t + i.k2, t + i.k3]; }
+        case 'BOX': return ['C' + i.k1, 'C' + i.k2, 'P' + i.k2, 'P' + i.k1];
+        default: return [id];
+      }
     }
 
-    // ---------- the story of a fill (A1-A4) ----------
-    //
-    // Told from the trade that happened. For a single option: edge against
-    // theo; does it pair with something already in the book; if not, the
-    // synthetic future against the board (arb or not); hedge; lean.
+    // E2: where to lean to get out, for any fill with no arb.
+    leanText(fill) {
+      const id = fill.id, inst = E.parse(id), bought = fill.side === 'buy', p = fill.price;
+      if (inst.kind === 'V') {
+        const S = this.model.S, e = (p - Math.abs(S - inst.k)) / 2;
+        const c = e + Math.max(S - inst.k, 0), pu = e + Math.max(inst.k - S, 0);
+        const legs = Math.abs(c - pu) < 1e-9 ? `the ${inst.k} call or put ${bought ? 'down' : 'up'} to ${fmtP(c)}` : `the ${inst.k} call ${bought ? 'down' : 'up'} to ${fmtP(c)} or the put to ${fmtP(pu)}`;
+        return `${bought ? 'Offer above' : 'Bid below'} ${fmtP(p)} to get out: the straddle, or ${legs}.`;
+      }
+      return `${bought ? 'Offer it above' : 'Bid it below'} ${fmtP(p)} to get out.`;
+    }
+
+    // ---------- the story of a fill (A1-A5, E2) ----------
     fillSteps(fill, board) {
       const m = this.model, id = fill.id, q = fill.qty, bought = fill.side === 'buy';
       const T = E.theo(m, id), e = bought ? T - fill.price : fill.price - T;
-      const steps = [];
+      const steps = [], out = { steps, bestLock: 0, lv: null };
+      const head = `You ${bought ? 'bought' : 'sold'} ${n2(q)} ${E.label(id)} at ${fmtP(fill.price)}, theo ${n2(T)}: ${signed(e)} a lot.`;
       const hitMark = { id, side: bought ? 'bid' : 'ask', act: 'you', note: `${bought ? 'bought' : 'sold'} ${n2(q)}` };
-      steps.push({ text: `You ${bought ? 'bought' : 'sold'} ${n2(q)} ${E.label(id)} at ${fmtP(fill.price)}. Theo ${n2(T)}: ${signed(e)} a lot.`,
-        why: this.whyTheo(id), marks: [hitMark] });
-      const out = { steps, bestLock: 0, lv: null };
-      if (!isOption(id)) return this.genericFill(fill, board, out);
+      const best = E.bestLayoff(board, E.position([fill]));
+      out.bestLock = best ? best.locked : 0;
+      const delta = (bought ? 1 : -1) * q * E.delta(m, id);
+      const hedgeN = Math.round(Math.abs(delta)), hedgeSide = delta > 0 ? 'sell' : 'buy';
+      const hedgeMark = { id: 'S', side: hedgeSide === 'buy' ? 'ask' : 'bid', act: hedgeSide, note: `${hedgeSide} ${hedgeN}` };
+      const hedge = hedgeN ? `${hedgeSide === 'buy' ? 'Buy' : 'Sell'} ${hedgeN} stock to be delta flat` : '';
+
+      if (!isOption(id)) {
+        const imp = posBid(E.implied(Sc.roomBoard(board), id));
+        const back = bought ? imp.bid : imp.ask;
+        const short = `You ${bought ? 'bought' : 'sold'} ${n2(q)} ${E.label(id)} at ${fmtP(fill.price)}.`;
+        const inst = E.parse(id), boxP = inst.kind === 'CS' ? `PS${inst.k1}/${inst.k2}` : inst.kind === 'PS' ? `CS${inst.k1}/${inst.k2}` : null;
+        const viaBox = best && best.route.length === 1 && best.route[0].id === boxP;
+        if (viaBox) {
+          const r = best.route[0], gap = inst.k2 - inst.k1, per = best.locked / q;
+          steps.push({ text: `${short} ${r.side === 'sell' ? 'Sell' : 'Buy'} the ${E.label(boxP)} at ${fmtP(r.price)} too: that's ${bought ? 'a long' : 'a short'} box, ${bought ? `${gap} − ${fmtP(fill.price)} − ${fmtP(r.price)}` : `${fmtP(fill.price)} + ${fmtP(r.price)} − ${gap}`} = ${signed(per)} a lot. Arb to flat: ${signed(best.locked)}.`,
+            why: this.whyRoute(id, best.route), marks: [hitMark, ...routeMarks(best.route, q)] });
+          return out;
+        }
+        if (best && best.locked > 1e-6) {
+          steps.push({ text: `${short} ${bought ? 'Sell' : 'Buy'} it back on the board: ${routeShort(best.route, q)}. Arb to flat: ${signed(best.locked)}.`,
+            why: this.whyRoute(id, best.route), marks: [hitMark, ...routeMarks(best.route, q)] });
+          return out;
+        }
+        const ed = back != null ? (bought ? back - fill.price : fill.price - back) : null;
+        steps.push({ text: `${head} ${back == null ? 'No arb on the board: hold it.' : `${bought ? 'Selling' : 'Buying'} it back on the board at ${fmtP(back)} ${ed < -1e-9 ? `loses ${n2(-ed)} a lot` : 'has nothing in it'}: hold it.`}`,
+          why: /^(CS|PS)/.test(id) ? `Spreads between close strikes hold their value through a session. Worth ${n2(T)}, it is a hold even when arbing out loses a little.` : '',
+          marks: [hitMark] });
+        const vWhy = /^V/.test(id) ? (() => { const k = E.parse(id).k, e = (fill.price - Math.abs(this.model.S - k)) / 2;
+          return `${bought ? 'Buying' : 'Selling'} the straddle at ${fmtP(fill.price)} ${bought ? 'buys' : 'sells'} ${fmtP(e)} of extrinsic in each leg. A vol level is an extrinsic level: ${bought ? 'selling' : 'buying'} the call or the put back ${bought ? 'above' : 'below'} it ${bought ? 'sells' : 'buys'} that vol back at a profit.`; })() : '';
+        steps.push({ text: `${hedge ? hedge + ', and ' + this.leanText(fill).toLowerCase() : this.leanText(fill)}`, why: [hedge ? this.whyHedge(fill) : '', vWhy].filter(Boolean).join(' '), marks: hedgeN ? [hedgeMark] : [] });
+        return out;
+      }
 
       const lv = this.levels(fill);
       out.lv = lv;
       const P = lv.partner, K = lv.K;
       const cp = (px, py) => (lv.isCall ? [px, py] : [py, px]);
 
-      // Does it complete a synthetic with something already in the book?
+      // Completes a synthetic with the partner already in the book.
       const earlier = this.trades.filter(t => t !== fill && t.id === P);
       const net = earlier.reduce((a, t) => a + (t.side === 'buy' ? t.qty : -t.qty), 0);
       const want = bought ? -1 : 1;
@@ -707,90 +857,63 @@
         const stock = this.trades.filter(t => t.id === 'S' && t.side === lv.stockSide && t.beat < this.n);
         const sPx = stock.length ? stock.reduce((a, t) => a + t.price * t.qty, 0) / stock.reduce((a, t) => a + t.qty, 0) : lv.s;
         const [c, p] = cp(fill.price, py);
-        const F = K + c - p;
-        const ed = lv.longFut ? sPx - F : F - sPx;
-        steps.push({ text: `With the ${E.label(P)} you ${want > 0 ? 'bought' : 'sold'} at ${fmtP(py)}, that's ${lv.longFut ? 'a long' : 'a short'} future at ${this.futText(K, c, p)}. Your stock ${lv.stockSide === 'sell' ? 'sold' : 'bought'} at ${fmtP(sPx)}: ${signed(ed)} a lot.`,
-          why: this.whySynth(K), marks: [hitMark, { id: 'S', side: null, act: 'ref', note: `${lv.stockSide === 'sell' ? 'sold' : 'bought'} ${fmtP(sPx)}` }] });
-        out.paired = true;
-        // Stock still to trade, from the book before this beat's own trades.
+        const ed = lv.longFut ? sPx - (K + c - p) : (K + c - p) - sPx;
         const before = this.trades.filter(t => t.beat < this.n || t === fill);
         const n = Math.round(-E.positionDelta(this.model, before));
-        steps.push({ text: n ? `${n > 0 ? 'Buy' : 'Sell'} ${Math.abs(n)} more stock to hedge to delta flat, and the pair is done.` : 'Your stock already covers it: delta flat.',
-          why: this.whyHedge(fill), marks: n ? [{ id: 'S', side: n > 0 ? 'ask' : 'bid', act: n > 0 ? 'buy' : 'sell', note: `${n > 0 ? 'buy' : 'sell'} ${Math.abs(n)}` }] : [] });
+        steps.push({ text: `${head} With the ${E.label(P)} you ${want > 0 ? 'bought' : 'sold'} at ${fmtP(py)}, that's ${lv.longFut ? 'a long' : 'a short'} future at ${this.futText(K, c, p)} against stock ${lv.stockSide === 'sell' ? 'sold' : 'bought'} at ${fmtP(sPx)}: ${signed(ed)} a lot.${n ? ` ${n > 0 ? 'Buy' : 'Sell'} ${Math.abs(n)} more stock to hedge to delta flat.` : ''}`,
+          why: this.whySynth(K), marks: [hitMark, ...(n ? [{ id: 'S', side: n > 0 ? 'ask' : 'bid', act: n > 0 ? 'buy' : 'sell', note: `${n > 0 ? 'buy' : 'sell'} ${Math.abs(n)}` }] : [])] });
+        out.paired = true;
         return out;
       }
 
-      // Against the board: the partner and the stock.
+      // Against the board: the partner and the stock (P3).
       const pq = board.quotes[P];
       const ps = lv.partnerSide === 'sell' ? 'bid' : 'ask';
       const py = pq && pq[ps] != null && sz(pq, ps) > 0 ? pq[ps] : null;
-      const best = E.bestLayoff(board, E.position([fill]));
-      out.bestLock = best ? best.locked : 0;
-      if (py != null) {
-        const [c, p] = cp(fill.price, py);
-        const ed = lv.edge(py);
-        steps.push({
-          text: `${lv.partnerSide === 'sell' ? 'Sell' : 'Buy'} the ${E.label(P)} at ${fmtP(py)} against it and you've ${lv.longFut ? 'bought' : 'sold'} the future at ${this.futText(K, c, p)}. Stock ${lv.longFut ? 'bid' : 'offered'} at ${fmtP(lv.s)}: ${ed > 1e-9 ? `${signed(ed)} a lot.` : ed < -1e-9 ? `that loses ${n2(-ed)} a lot.` : 'no arb.'}`,
-          why: `${this.whySynth(K)} ${this.whyPartner(fill, lv)}`,
-          marks: [hitMark, { id: P, side: ps, act: lv.partnerSide, note: `${lv.partnerSide} ${fmtP(py)}` }, { id: 'S', side: lv.stockSide === 'buy' ? 'ask' : 'bid', act: lv.stockSide, note: `${lv.stockSide} ${fmtP(lv.s)}` }] });
-      }
-      const hedgeN = Math.round(Math.abs(q * E.delta(m, id)));
-      const hedgeSide = (bought ? 1 : -1) * E.delta(m, id) > 0 ? 'sell' : 'buy';
-      const hedgeMark = { id: 'S', side: hedgeSide === 'buy' ? 'ask' : 'bid', act: hedgeSide, note: `${hedgeSide} ${hedgeN}` };
-      // A resting price in the partner: its theo, or a tick through
-      // break-even if theo doesn't beat it.
       const pT = E.theo(m, P);
       let lean = lv.partnerSide === 'sell' ? E.ceilT(pT) : E.floorT(pT);
       if (lv.partnerSide === 'sell' ? lean <= lv.be : lean >= lv.be) lean = lv.partnerSide === 'sell' ? lv.be + E.TICK : lv.be - E.TICK;
       const leanEdge = lv.partnerSide === 'sell' ? lean - lv.be : lv.be - lean;
-      const leanMark = { id: P, side: py != null ? ps : null, act: 'you', note: `break-even ${fmtP(lv.be)}` };
       out.lean = { id: P, side: lv.partnerSide, price: lean, edge: leanEdge };
+      const leanMark = { id: P, side: py != null ? ps : null, act: 'you', note: `break-even ${fmtP(lv.be)}` };
+      const futLine = py != null ? (() => {
+        const [c, p] = cp(fill.price, py), ed = lv.edge(py);
+        return ` ${lv.partnerSide === 'sell' ? 'Sell' : 'Buy'} the ${E.label(P)} at ${fmtP(py)} against it and you've ${lv.longFut ? 'bought' : 'sold'} the future at ${this.futText(K, c, p)}. Stock ${lv.longFut ? 'bid' : 'offered'} at ${fmtP(lv.s)}: ${ed > 1e-9 ? `${signed(ed)} a lot.` : ed < -1e-9 ? `that loses ${n2(-ed)} a lot.` : 'no arb.'}`;
+      })() : '';
+      const futMarks = py != null ? [{ id: P, side: ps, act: lv.partnerSide, note: `${lv.partnerSide} ${fmtP(py)}` }, { id: 'S', side: lv.stockSide === 'buy' ? 'ask' : 'bid', act: lv.stockSide, note: `${lv.stockSide} ${fmtP(lv.s)}` }] : [];
+      const leanLine = `${lv.partnerSide === 'sell' ? 'offer' : 'bid'} the ${E.label(P)} at ${fmtP(lean)}: ${signed(leanEdge)} a lot if it trades`;
       if (best && best.locked > 1e-6) {
-        steps.push({ text: `That's an arb. Do it for all ${n2(q)}: ${routeShort(best.route, q)}. Arb to flat, ${signed(best.locked)}.`,
-          why: this.whySynth(K), marks: routeMarks(best.route, q) });
-        steps.push({ text: `Or hedge the delta (${hedgeSide} ${hedgeN} stock) and ${lv.partnerSide === 'sell' ? 'offer' : 'bid'} the ${E.label(P)} at ${fmtP(lean)}: ${signed(leanEdge)} a lot if it trades, against ${signed(best.locked / q)} crossing now.`,
-          why: `${this.whyLean(fill, lv)} ${this.whyHedge(fill)}`, marks: [leanMark, hedgeMark] });
-      } else {
-        steps.push({ text: `No arb, so hold it outright and hedge the delta: ${hedgeSide} ${hedgeN} stock to be delta flat.`,
-          why: this.whyHedge(fill), marks: [hitMark, hedgeMark] });
-        steps.push({ text: `Then lean to get out: ${lv.partnerSide === 'sell' ? 'offer' : 'bid'} the ${E.label(P)} ${lv.partnerSide === 'sell' ? 'above' : 'below'} ${fmtP(lv.be)}, say ${fmtP(lean)} (${signed(leanEdge)} a lot if it trades), and ${bought ? 'drop your bid' : 'lift your offer'} in the ${E.label(id)}.`,
-          why: this.whyLean(fill, lv), marks: [leanMark] });
+        steps.push({ text: `You ${bought ? 'bought' : 'sold'} ${n2(q)} ${E.label(id)} at ${fmtP(fill.price)}.${futLine} Arb to flat for all ${n2(q)}: ${signed(best.locked)}.`,
+          why: this.whySynth(K), marks: [hitMark, ...routeMarks(best.route, q)] });
+        // A resting price can beat crossing (A3); say so only when it does.
+        if (leanEdge > best.locked / q + 1e-9) steps.push({ text: `Or ${hedge ? hedge.toLowerCase() + ' and ' : ''}${leanLine}, against ${signed(best.locked / q)} crossing now.`,
+          why: `${this.whyLean(fill, lv)} ${this.whyPartner(fill, lv)}`, marks: [leanMark, ...(hedgeN ? [hedgeMark] : [])] });
+        return out;
       }
+      steps.push({ text: `${head}${futLine || ' No arb on the board.'}`, why: `${this.whySynth(K)} ${py != null ? this.whyPartner(fill, lv) : ''}`.trim(), marks: [hitMark, ...futMarks] });
+      if (!(lv.be > 0)) {
+        if (hedge) steps.push({ text: `Hold it: ${hedge.toLowerCase()}.`, why: this.whyHedge(fill), marks: [hedgeMark] });
+        return out;
+      }
+      steps.push({ text: `Hold it: ${hedge ? hedge.toLowerCase() + ', then ' : ''}${lv.partnerSide === 'sell' ? 'offer' : 'bid'} the ${E.label(P)} ${lv.partnerSide === 'sell' ? 'above' : 'below'} ${fmtP(lv.be)}, say ${fmtP(lean)} (${signed(leanEdge)} a lot if it trades).`,
+        why: `${hedge ? this.whyHedge(fill) + ' ' : ''}${this.whyLean(fill, lv)}`, marks: [leanMark, ...(hedgeN ? [hedgeMark] : [])] });
       return out;
     }
-
-    // A fill in a structure: lay it off on the board, or hold and hedge.
-    genericFill(fill, board, out) {
-      const bought = fill.side === 'buy', id = fill.id, q = fill.qty;
-      const imp = E.implied(board, id);
-      const px = bought ? imp.bid : imp.ask, route = bought ? imp.bidRoute : imp.askRoute;
-      if (px != null) {
-        const ed = bought ? px - fill.price : fill.price - px;
-        out.steps.push({ text: `${bought ? 'Sell' : 'Buy'} it back on the board: ${routeShort(route)} = ${fmtP(px)}. ${ed > 1e-9 ? `${signed(ed)} a lot.` : ed < -1e-9 ? `That loses ${n2(-ed)} a lot.` : 'No edge.'}`,
-          why: this.whyRoute(id, route), marks: routeMarks(route) });
-      }
-      const best = E.bestLayoff(board, E.position([fill]));
-      out.bestLock = best ? best.locked : 0;
-      if (best && best.locked > 1e-6) {
-        out.steps.push({ text: `Do it for all ${n2(q)}: arb to flat, ${signed(best.locked)}.`, why: this.whyRoute(id, best.route), marks: routeMarks(best.route, q) });
-      } else {
-        const need = -E.positionDelta(this.model, [fill]);
-        const n = Math.round(Math.abs(need));
-        out.steps.push({ text: `No arb, so hold it outright and hedge the delta: ${need > 0 ? 'buy' : 'sell'} ${n} stock to be delta flat.`,
-          why: `The ${E.label(id)} has a delta of ${signed(E.delta(this.model, id))} a lot. ${this.whyTheo(id)}`,
-          marks: n ? [{ id: 'S', side: need > 0 ? 'ask' : 'bid', act: need > 0 ? 'buy' : 'sell', note: `${need > 0 ? 'buy' : 'sell'} ${n}` }] : [] });
-      }
-      return out;
+    whyPartner(fill, lv) {
+      const K = lv.K, p = fill.price, s = lv.s, v = fill.side === 'buy' ? 'buying' : 'selling';
+      return fill.id[0] === 'P'
+        ? `${v[0].toUpperCase() + v.slice(1)} the ${K} put at ${fmtP(p)} with stock at ${fmtP(s)} is ${v} the ${K} call at ${fmtP(p)} + ${fmtP(s)} − ${K} = ${fmtP(p + s - K)}.`
+        : `${v[0].toUpperCase() + v.slice(1)} the ${K} call at ${fmtP(p)} with stock at ${fmtP(s)} is ${v} the ${K} put at ${fmtP(p)} − ${fmtP(s)} + ${K} = ${fmtP(p - s + K)}.`;
     }
 
-    // Your resting prices this beat, judged against break-even (A3).
+    // Your resting prices this beat, against break-even (A3).
     leanVerdicts(lv, fill) {
       const out = [];
       for (const p of this.posts) {
         if (lv && p.id === lv.partner && p.side === lv.partnerSide) {
           const ed = lv.partnerSide === 'sell' ? p.price - lv.be : lv.be - p.price;
-          out.push(ed > 1e-9 ? ['good', `Your ${fmtP(p.price)} ${p.side === 'buy' ? 'bid' : 'offer'} in the ${E.label(p.id)}: ${signed(ed)} a lot if it trades (break-even ${fmtP(lv.be)}).`]
-            : ['bad', `Your ${fmtP(p.price)} ${p.side === 'buy' ? 'bid' : 'offer'} in the ${E.label(p.id)} doesn't beat break-even ${fmtP(lv.be)}.`]);
+          out.push(ed > 1e-9 ? ['good', `Your ${fmtP(p.price)} ${p.side === 'buy' ? 'bid' : 'offer'} in the ${E.label(p.id)}: ${signed(ed)} a lot if it trades.`]
+            : ['bad', `Your ${fmtP(p.price)} ${p.side === 'buy' ? 'bid' : 'offer'} in the ${E.label(p.id)} is through break-even ${fmtP(lv.be)}.`]);
         } else if (fill && p.id === fill.id && (p.side === 'buy') === (fill.side === 'buy')) {
           const worse = fill.side === 'buy' ? p.price > fill.price : p.price < fill.price;
           if (worse) out.push(['warn', `You're ${fill.side === 'buy' ? 'long' : 'short'} the ${E.label(fill.id)}: ${fill.side === 'buy' ? 'bidding higher' : 'offering lower'} adds to it at a worse price.`]);
@@ -799,28 +922,57 @@
       return out;
     }
 
+    // A7: trades that add up to one structure, held, are a position, not an arb.
+    positionVerdict() {
+      const own = this.beatTrades.filter(t => t.who === 'board');
+      if (!own.length || this.status().flat) return null;
+      const st = structureOf(own, this.board.strikes);
+      if (!st) return null;
+      const long = st.qty > 0, imp = E.implied(Sc.roomBoard(this.board), st.id);
+      const back = long ? imp.bid : imp.ask;
+      if (back == null) return ['warn', `That's ${long ? 'long' : 'short'} the ${E.label(st.id)} at ${fmtP(st.price)}: a position, not an arb.`];
+      const ed = long ? back - st.price : st.price - back;
+      return ed > 1e-9 ? ['warn', `That's ${long ? 'long' : 'short'} the ${E.label(st.id)} at ${fmtP(st.price)}, and the board ${long ? 'buys' : 'sells'} it back at ${fmtP(back)}: finish the arb.`]
+        : ['bad', `That's ${long ? 'long' : 'short'} the ${E.label(st.id)} at ${fmtP(st.price)}: a position, not an arb. The board ${long ? 'buys it back' : 'sells it back'} at ${fmtP(back)}.`];
+    }
+
+    // M6: after the market buys (or sells) at one strike, the strike next to
+    // it should go the same way.
+    sympathyVerdict(ev) {
+      if (!ev || !/^[CPV]\d/.test(ev.id)) return null;
+      const k = +ev.id.replace(/^[CPV]/, ''), gap = this.board.spacing;
+      const last = [...this.trades].reverse().find(t => t.fromMarket && t.beat < this.n && /^[CPV]\d/.test(t.id));
+      if (!last || Math.abs(+last.id.replace(/^[CPV]/, '') - k) !== gap) return null;
+      const bought = last.side === 'sell', m = (ev.bid + ev.ask) / 2;
+      if (bought ? m >= ev.T - E.TICK / 2 : m <= ev.T + E.TICK / 2) return null;
+      return ['warn', `The market just ${bought ? 'bought' : 'sold'} the ${E.label(last.id)}: that's ${bought ? 'buying' : 'selling'} vol. Lean the ${E.label(ev.id)} the same way, ${bought ? 'up' : 'down'}, not ${bought ? 'down' : 'up'}.`];
+    }
+
+    // E4: one line, only for money or a mistake.
     bookVerdict(first, st, book) {
       const gross = first ? Math.abs(first.qty * E.delta(this.model, first.id)) : 0;
       const ok = Math.abs(book.delta) <= Math.max(1, 0.1 * gross);
-      return book.flat ? ['good', `Book flat: ${signed(book.pnl)}.`]
-        : st.flat ? ['good', `Arbed to flat: ${signed(st.pnl)}.`]
-        : ok ? ['good', `Held outright, delta-hedged: ${signed(st.pnl)} at theo.`]
-        : ['bad', `Delta not hedged: ${signed(Math.round(book.delta))} shares in the book.`];
+      if (book.flat) return book.pnl > 1e-9 ? ['good', `Book flat: ${signed(book.pnl)}.`] : book.pnl < -1e-9 ? ['bad', `Book flat, but at ${signed(book.pnl)}.`] : null;
+      if (st.flat) return st.pnl > 1e-9 ? ['good', `Arbed to flat: ${signed(st.pnl)}.`] : st.pnl < -1e-9 ? ['bad', `Flat, but at ${signed(st.pnl)}.`] : null;
+      return ok ? null : ['bad', `Delta not hedged: ${signed(Math.round(book.delta))} shares in the book.`];
     }
 
     // ---------- judging ----------
 
-    // Your market against the board (M1, M2, M3).
-    quoteVerdict(ev) {
-      const ib = ev.imp.bid, ia = ev.imp.ask;
-      if (ev.arbBid || ev.arbAsk) return ['bad', `Your ${fmtP(ev.bid)} / ${fmtP(ev.ask)} crosses the board: you can be arbed.`];
+    // Your market against the board (M1, M2, M3), E3: once a side has
+    // traded, the other side isn't judged for being armable.
+    quoteVerdict(ev, traded = false) {
+      const ib = ev.imp.bid, ia = ev.imp.ask, tk = E.TICK;
+      if (ev.arbBid) return ['bad', `Your ${fmtP(ev.bid)} bid is above the board's ${fmtP(ia)} offer: you can be arbed.`];
+      if (ev.arbAsk) return ['bad', `Your ${fmtP(ev.ask)} offer is below the board's ${fmtP(ib)} bid: you can be arbed.`];
       if (!ev.containsTheo) return ['bad', `Your ${fmtP(ev.bid)} / ${fmtP(ev.ask)} doesn't contain theo ${n2(ev.T)}.`];
-      if (ib != null && ev.bid >= ib - 1e-9) return ['warn', `Your ${fmtP(ev.bid)} bid is ${ev.bid > ib + 1e-9 ? 'inside' : 'on'} the board's ${fmtP(ib)}: if it's hit you can't lay it off. Bid ${fmtP(Math.max(0, ib - 0.5))}.`];
-      if (ia != null && ev.ask <= ia + 1e-9) return ['warn', `Your ${fmtP(ev.ask)} offer is ${ev.ask < ia - 1e-9 ? 'inside' : 'on'} the board's ${fmtP(ia)}: if it's lifted you can't lay it off. Offer ${fmtP(ia + 0.5)}.`];
+      if (traded) return null;
+      if (ib != null && ev.bid >= ib - 1e-9) return ['warn', `Your ${fmtP(ev.bid)} bid is ${ev.bid > ib + 1e-9 ? 'inside' : 'on'} the board's ${fmtP(ib)}: if it's hit, you can only ${ev.bid > ib + 1e-9 ? 'lose' : 'scratch'}. Bid ${fmtP(Math.max(0, ib - tk))}.`];
+      if (ia != null && ev.ask <= ia + 1e-9) return ['warn', `Your ${fmtP(ev.ask)} offer is ${ev.ask < ia - 1e-9 ? 'inside' : 'on'} the board's ${fmtP(ia)}: if it's lifted, you can only ${ev.ask < ia - 1e-9 ? 'lose' : 'scratch'}. Offer ${fmtP(ia + tk)}.`];
       const S = this.start.board.quotes.S, half = (S.ask - S.bid) / 2, cost = Math.abs(ev.D) * half;
       const thin = Math.min(ev.T - ev.bid, ev.ask - ev.T);
-      if (isOption(ev.id) && thin < cost - 1e-9) return ['warn', `${n2(thin)} of edge on one side doesn't cover the hedge: ${n2(Math.abs(ev.D))} delta × ${n2(half)} = ${n2(cost)} a lot.`];
-      return ['good', 'Good market: armable and around theo.'];
+      if (isOption(ev.id) && thin < cost - 1e-9) return ['warn', `${n2(thin)} of edge on one side doesn't pay the hedge: ${n2(Math.abs(ev.D))} delta × ${n2(half)} = ${n2(cost)} a lot.`];
+      return null;
     }
 
     // A make-a-market question (including a follow-up), or the market
@@ -828,38 +980,34 @@
     judgeHit() {
       const b = this.beat, ev = this.marketEval, t = b.target;
       const steps = [], verdict = [];
-      const fu = b.followUp;
+      const add = v => { if (v) verdict.push(v); };
+      const fu = b.followUp, fill = this.fills[0];
 
       if (fu && ev) {
         const f = fu.fill, lv = this.levels(f);
         const ys = fu.exitSide === 'sell' ? 'ask' : 'bid', yp = ev[ys];
-        const leg = lv.isCall ? `${lv.K} + ${fmtP(f.price)} − P` : `${lv.K} + C − ${fmtP(f.price)}`;
-        steps.push({ text: `You ${f.side === 'buy' ? 'bought' : 'sold'} ${n2(f.qty)} ${E.label(f.id)} at ${fmtP(f.price)}. ${fu.exitSide === 'sell' ? 'Selling' : 'Buying'} the ${E.label(t)} makes ${lv.longFut ? 'a long' : 'a short'} future at ${leg}; against stock at ${fmtP(lv.s)}, break-even is ${fmtP(lv.be)}.`,
-          why: `${this.whySynth(lv.K)} ${this.whyLean(f, lv)}`,
-          marks: [{ id: t, side: ys, act: 'you', note: `break-even ${fmtP(lv.be)}` }, { id: 'S', side: lv.stockSide === 'buy' ? 'ask' : 'bid', act: 'ref', note: fmtP(lv.s) }] });
+        steps.push({ text: `You're ${f.side === 'buy' ? 'long' : 'short'} the ${E.label(f.id)} from ${fmtP(f.price)}: the ${E.label(t)} breaks even at ${fmtP(lv.be)}. ${fu.exitSide === 'sell' ? 'Offer above' : 'Bid below'} it.`,
+          why: this.whyLean(f, lv), marks: [{ id: t, side: ys, act: 'you', note: `break-even ${fmtP(lv.be)}` }] });
         const ed = fu.exitSide === 'sell' ? yp - lv.be : lv.be - yp;
-        verdict.push(ed > 1e-9 ? ['good', `Your ${fmtP(yp)} ${ys === 'ask' ? 'offer' : 'bid'} beats break-even ${fmtP(lv.be)}: ${signed(ed)} a lot if it trades.`]
+        add(ed > 1e-9 ? ['good', `Your ${fmtP(yp)} ${ys === 'ask' ? 'offer' : 'bid'} beats break-even ${fmtP(lv.be)}: ${signed(ed)} a lot if it trades.`]
           : ['bad', `Your ${fmtP(yp)} ${ys === 'ask' ? 'offer' : 'bid'} doesn't beat break-even ${fmtP(lv.be)}.`]);
       } else if (ev) {
-        steps.push(this.theoStep(t));
-        verdict.push(this.quoteVerdict(ev));
+        steps.push(this.priceStep(t));
+        add(this.quoteVerdict(ev, !!fill));
+        add(this.sympathyVerdict(ev));
       }
 
       const res = { type: b.type === 'react' ? 'react' : 'make', title: this.beatTitle(), verdict, steps, pnl: 0, bestLock: 0 };
       const mine = this.beatTrades;
       const st = this.status(mine), book = this.status();
       res.pnl = st.pnl;
-      const fill = this.fills[0];
-      if (!fill) {
-        if (!mine.length) verdict.push(['good', 'No trade.']);
-        return res;
-      }
+      if (!fill) return res;
       const story = this.fillSteps(fill, this.afterHit.board);
       steps.push(...story.steps);
       res.bestLock = story.bestLock;
       verdict.push(...this.leanVerdicts(story.lv, fill));
-      if (story.bestLock > 1e-6 && !st.flat && !book.flat && !this.posts.length) verdict.push(['warn', `There was an arb: ${signed(story.bestLock)} to flat on the board.`]);
-      verdict.push(this.bookVerdict(fill, st, book));
+      if (story.bestLock > 1e-6 && !st.flat && !book.flat && !this.posts.length) add(['warn', `There was an arb: ${signed(story.bestLock)} to flat on the board.`]);
+      add(this.positionVerdict() || this.bookVerdict(fill, st, book));
       res.flat = book.flat;
       return res;
     }
@@ -870,48 +1018,70 @@
       const best = E.bestArb(sb);
       const orderTrades = b.asked ? this.beatTrades.slice(0, b.orderTrades) : this.beatTrades;
       const st = this.status(orderTrades), book = this.status();
-      const steps = [];
+      const steps = [], verdict = [];
+      const add = v => { if (v) verdict.push(v); };
+      if (o) best.route.sort((x, y) => (y.id === o.id) - (x.id === o.id));
+      const unit = best.route.length ? best.route[0].qty : 1;
+      let impIds = null;
       if (o) {
         const imp = E.implied(sb, o.id);
         const other = o.side === 'bid' ? imp.ask : imp.bid, route = o.side === 'bid' ? imp.askRoute : imp.bidRoute;
-        const T = E.theo(this.model, o.id);
-        steps.push({ text: `${o.side === 'bid' ? 'Bid' : 'Offer'} ${fmtP(o.price)} in the ${E.label(o.id)}. Theo ${n2(T)}.`, why: this.whyTheo(o.id),
-          marks: [{ id: o.id, side: o.side, act: 'ref', note: `${o.side === 'bid' ? 'bid' : 'offer'} ${fmtP(o.price)}` }] });
-        if (other != null) steps.push({ text: `The same thing on the board: ${routeShort(route)} = ${fmtP(other)}.`, why: this.whyRoute(o.id, route),
-          marks: [{ id: o.id, side: o.side, act: 'ref', note: `vs ${fmtP(other)}` }, ...routeMarks(route)] });
+        impIds = (route || []).map(r => r.id).sort().join();
+        // O1: a bid is a chance to sell, an offer a chance to buy. In a
+        // straddle or an option that is vol: sell it to the bid, buy the
+        // same extrinsic back cheaper through the legs.
+        const vol = /^[VCP]\d/.test(o.id), bid = o.side === 'bid';
+        const legsTxt = route ? routeShort(route) : '';
+        const lead = bid
+          ? `${E.label(o.id)} bid ${fmtP(o.price)}: ${vol ? 'vol is bid, so sell it to them' : 'sell it to them'}`
+          : `${E.label(o.id)} offered at ${fmtP(o.price)}: ${vol ? 'vol is offered, so buy it from them' : 'buy it from them'}`;
+        steps.push({ text: other == null ? `${lead}, if the board gave an arb. It doesn't.`
+          : `${lead}, and ${bid ? 'buy' : 'sell'} it back ${bid ? 'cheaper' : 'higher'} on the board: ${legsTxt} = ${fmtP(other)}.`,
+          why: other == null ? '' : /^V/.test(o.id) && Math.abs(this.model.S - E.parse(o.id).k) < 1e-9
+            ? `At the money the call and the put carry the same extrinsic, so a call at ${fmtP(other / 2)} is the straddle at ${fmtP(other)}. ${bid ? 'Selling' : 'Buying'} it at ${fmtP(o.price)} and ${bid ? 'buying' : 'selling'} it back at ${fmtP(other)} ${bid ? 'sells vol higher than you buy it' : 'buys vol lower than you sell it'}.`
+            : this.whyRoute(o.id, route),
+          marks: [{ id: o.id, side: o.side, act: 'ref', note: `${o.side === 'bid' ? 'bid' : 'offer'} ${fmtP(o.price)}` }, ...(route ? routeMarks(route) : [])] });
       }
-      if (o) best.route.sort((x, y) => (y.id === o.id) - (x.id === o.id));
-      const unit = best.route.length ? best.route[0].qty : 1;
-      if (best.value > 1e-6) steps.push({ text: `Trade both, ${n2(unit)} lots: ${routeShort(best.route, unit)}. Arb to flat: ${signed(best.value)}.`,
-        why: `Edge × size: take all the board lets you lay off, which is the thinnest leg. ${o ? this.whyRoute(o.id, best.route) : ''}`, marks: routeMarks(best.route, unit) });
-      else steps.push({ text: 'Nothing in it: the order pays no more than the board.', why: 'An order is only worth taking if you can do the opposite on the board for less. At the board\'s own level, all you get is the risk.', marks: o ? [{ id: o.id, side: o.side, act: 'bad', note: 'no edge' }] : [] });
-      const res = { type: 'opp', title: this.beatTitle(), steps, verdict: [], pnl: st.pnl, best: best.value };
+      if (best.value > 1e-6) {
+        const legs = best.route.filter(r => !o || r.id !== o.id);
+        const same = o && legs.map(r => r.id).sort().join() === impIds;
+        const thin = o && b.size > unit + 1e-9 ? legs.filter(r => r.id !== 'S').sort((x, y) => x.qty - y.qty)[0] : null;
+        const thinSide = thin ? (thin.side === 'buy' ? 'offer' : 'bid') : '';
+        steps.push({ text: `${o ? `Do it ${n2(unit)} times${thin ? `, as many as the ${E.label(thin.id)} ${thinSide} allows` : ''}` : 'There is an arb'}${same ? '' : `: ${routeShort(best.route, unit)}`}. Arb to flat: ${signed(best.value / unit)} a lot, ${signed(best.value)}.${thin ? ` Take the ${E.label(thin.id)} first: the ${E.label(o.id)} ${o.side} has ${n2(b.size)} to ${o.side === 'bid' ? 'sell into' : 'buy from'}.` : ''}`,
+          why: thin ? 'Trade the scarce leg first and keep the size as your exit. If the order is being pushed one way, that is the side to be on.' : '', marks: routeMarks(best.route, unit) });
+      } else {
+        steps.push({ text: o ? 'Nothing in it.' : 'Nothing on the board to arb.', why: o ? 'An order is worth taking only if the board does the other side for less.' : '', marks: o ? [{ id: o.id, side: o.side, act: 'bad', note: 'no edge' }] : [] });
+      }
+      const res = { type: 'opp', title: this.beatTitle(), steps, verdict, pnl: st.pnl, best: best.value };
       const traded = orderTrades.length > 0;
       if (best.value <= 1e-6) {
-        res.verdict.push(!traded ? ['good', 'Right to leave it.']
-          : st.flat && st.pnl > -1e-6 ? ['good', 'Flat, nothing lost.']
-          : ['bad', `Nothing there: ${signed(st.pnl)} at theo.`]);
+        if (traded && !(st.flat && st.pnl > -1e-6)) add(['bad', `Nothing there: ${signed(st.pnl)} at theo.`]);
       } else if (!traded) {
-        res.verdict.push(['bad', `Missed: ${signed(best.value)} was there.`]);
+        add(['bad', `Missed: ${signed(best.value)} was there.`]);
       } else if (st.flat) {
-        res.verdict.push(st.pnl / best.value > 0.98 ? ['good', `Arbed to flat: ${signed(st.pnl)}, the full amount.`]
+        add(st.pnl / best.value > 0.98 ? ['good', `Arbed to flat: ${signed(st.pnl)}.`]
           : st.pnl > 0 ? ['warn', `Arbed to flat: ${signed(st.pnl)} of ${signed(best.value)}. Check the size and the legs.`]
           : ['bad', `Flat, but at ${signed(st.pnl)}.`]);
       } else {
-        res.verdict.push(Math.abs(book.delta) <= 1 ? ['warn', `Held outright, delta-hedged, not arbed to flat: ${signed(st.pnl)} at theo.`]
-          : ['bad', `Delta not hedged: ${signed(Math.round(book.delta))} shares in the book.`]);
+        // Traded the order but not the way out (or the reverse): say which.
+        const tookOrder = o && orderTrades.some(t => t.id === o.id);
+        const legs = best.route.filter(r => !o || r.id !== o.id);
+        const legTxt = routeShort(legs, unit);
+        if (tookOrder) add(['bad', `You ${o.side === 'bid' ? 'sold the' : 'bought the'} ${E.label(o.id)} ${o.side === 'bid' ? 'to the bid' : 'from the offer'} but didn't ${o.side === 'bid' ? 'buy it back' : 'sell it back'} on the board (${legTxt}): the arb was ${signed(best.value)}.`]);
+        else if (o) add(['bad', `You traded the board but not the ${E.label(o.id)} ${o.side === 'bid' ? 'bid' : 'offer'}: the arb was ${signed(best.value)}.`]);
+        else add(['bad', `Not arbed to flat: ${signed(best.value)} was there.`]);
       }
+      add(this.positionVerdict());
       // Then your own market in it (O5).
       if (b.asked && this.marketEval) {
-        const ev = this.marketEval;
-        steps.push({ text: `Your ${fmtP(ev.bid)} / ${fmtP(ev.ask)} in the ${E.label(ev.id)}: theo ${n2(ev.T)}, and the board makes it ${ev.imp.bid != null ? fmtP(ev.imp.bid) : '–'} / ${ev.imp.ask != null ? fmtP(ev.imp.ask) : '–'}.`,
+        const ev = this.marketEval, fill = this.fills[0];
+        steps.push({ text: `Your ${fmtP(ev.bid)} / ${fmtP(ev.ask)} in the ${E.label(ev.id)}: the board makes it ${ev.imp.bid != null ? fmtP(ev.imp.bid) : '–'} / ${ev.imp.ask != null ? fmtP(ev.imp.ask) : '–'}, theo ${n2(ev.T)}.`,
           why: this.whyTheo(ev.id), marks: [{ id: ev.id, side: null, act: 'you', note: `theo ${n2(ev.T)}` }] });
-        res.verdict.push(this.quoteVerdict(ev));
-        const fill = this.fills[0];
+        add(this.quoteVerdict(ev, !!fill));
         if (fill) {
           const story = this.fillSteps(fill, this.afterHit.board);
           steps.push(...story.steps);
-          res.verdict.push(this.bookVerdict(fill, this.status(this.beatTrades), book));
+          add(this.bookVerdict(fill, this.status(this.beatTrades), book));
         }
       }
       return res;
@@ -935,10 +1105,10 @@
         steps.push({ text: `${E.label(r.t)}: ${Math.round(r.d * 100)} delta, so about ${n2(r.need)} more a side. ${r.base ? `From ${was} you went to ${fmtP(r.ev.bid)} / ${fmtP(r.ev.ask)}: ${signed(r.wb)} / ${signed(r.wa)}.` : ''}`,
           why: this.whyTheo(r.t), marks: [{ id: r.t, side: null, act: 'you', note: `+${n2(r.need)} a side` }] });
         const q = this.quoteVerdict(r.ev);
-        if (q[0] === 'bad') verdict.push([q[0], `${E.label(r.t)}: ${q[1]}`]);
+        if (q && q[0] === 'bad') verdict.push([q[0], `${E.label(r.t)}: ${q[1]}`]);
         else if (r.base) {
           const lo = Math.min(r.wb, r.wa);
-          verdict.push(lo >= r.need - 0.25 - 1e-9 ? ['good', `${E.label(r.t)}: widened ${n2(r.wb)} / ${n2(r.wa)}, enough for ${Math.round(r.d * 100)} delta.`]
+          verdict.push(lo >= r.need - this.sc.U / 2 - 1e-9 ? ['good', `${E.label(r.t)}: widened ${n2(r.wb)} / ${n2(r.wa)}, enough for ${Math.round(r.d * 100)} delta.`]
             : ['bad', `${E.label(r.t)}: widened ${n2(r.wb)} / ${n2(r.wa)}, but ${Math.round(r.d * 100)} delta needs about ${n2(r.need)} a side.`]);
         }
       }
@@ -955,7 +1125,7 @@
       return { type: 'width', title: this.beatTitle(), verdict, steps, pnl: 0 };
     }
     whyHedgeWidth() {
-      return 'Every trade on your quote gets hedged by crossing the stock, which costs |delta| × half the stock spread a lot. When the stock widens, that cost rises in proportion to delta: a 95-delta option carries nearly a full share and needs nearly the full rise on each side, a 50-delta one about half, a 5-delta one almost nothing.';
+      return 'Hedging a fill costs |delta| × half the stock spread a lot, so when the stock widens each side needs about |delta| × the rise more edge.';
     }
 
     // One trade on a stale board: the most edge x size, net of hedge (S1).
@@ -977,12 +1147,12 @@
       const cands = this.candidates(), best = cands[0];
       const top3 = cands.filter(c => c.v > 1e-9).slice(0, 3);
       steps.push({ text: `Stock ${b.move > 0 ? 'up' : 'down'} ${fmtP(Math.abs(b.move))}: each option should have moved by its delta. ${b.move > 0 ? 'Calls are now cheap, puts rich.' : 'Calls are now rich, puts cheap.'}`,
-        why: 'When the stock moves and nothing else changes, a call moves by its delta times the move and a put by (call delta − 1) times it. Quotes that didn\'t move are stale. Each one\'s edge is theo less the price, less the hedge (|delta| × half the stock spread); what it is worth is that edge times the size showing. Deep in-the-money options move most.',
+        why: 'A call moves by its delta times the move, a put by (call delta − 1) times it. A quote that didn\'t move is worth its edge, less the hedge, times its size.',
         marks: top3.map(c => ({ id: c.id, side: c.qs, act: c.side, note: `${signed(c.e)} × ${n2(c.size)}` })) });
       if (best && best.v > 1e-9) steps.push({ text: `Best: ${best.side} ${n2(best.size)} × ${E.label(best.id)} at ${fmtP(best.price)}. Theo ${n2(best.T)}, hedge ${n2(best.hc)}: ${signed(best.e)} a lot × ${n2(best.size)} = ${signed(best.v)}.`,
         why: 'Edge × size, not edge alone: a smaller edge on a bigger size can be worth more.', marks: [{ id: best.id, side: best.qs, act: best.side, note: `${best.side} ${n2(best.size)}` }] });
       const tr = this.beatTrades.filter(t => t.id !== 'S')[0];
-      if (!tr) verdict.push(best && best.v > 1e-9 ? ['bad', `No trade: ${signed(best.v)} was there.`] : ['good', 'No trade.']);
+      if (!tr) { if (best && best.v > 1e-9) verdict.push(['bad', `No trade: ${signed(best.v)} was there.`]); }
       else {
         const c = cands.find(x => x.id === tr.id && x.side === tr.side) || { e: 0, hc: 0 };
         const v = c.e * tr.qty;
@@ -992,7 +1162,8 @@
         const d = -E.positionDelta(this.model, [tr]), n = Math.round(Math.abs(d));
         if (n) steps.push({ text: `Then hedge: ${d > 0 ? 'buy' : 'sell'} ${n} stock to be delta flat.`, why: this.whyHedge(tr),
           marks: [{ id: 'S', side: d > 0 ? 'ask' : 'bid', act: d > 0 ? 'buy' : 'sell', note: `${d > 0 ? 'buy' : 'sell'} ${n}` }] });
-        verdict.push(this.bookVerdict(tr, this.status(this.beatTrades), this.status()));
+        const bv = this.bookVerdict(tr, this.status(this.beatTrades), this.status());
+        if (bv) verdict.push(bv);
       }
       return { type: 'pick', title: this.beatTitle(), verdict, steps, pnl: this.status(this.beatTrades).pnl, best: best ? best.v : 0 };
     }
